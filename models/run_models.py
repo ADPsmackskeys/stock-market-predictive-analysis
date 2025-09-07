@@ -61,8 +61,19 @@ for ticker in available_tickers:
         dates_test = df["Date"].iloc[y_test.index]
         prices_test = df["Close"].iloc[y_test.index]
 
-        acc = model.evaluate_and_plot(df, y_test, y_pred, X, dates_test, prices_test)
+        if hasattr(model, "seq_len"):
+            seq_len = model.seq_len
+            dates_test_seq = dates_test.iloc[seq_len:]
+            prices_test_seq = prices_test.iloc[seq_len:]
+            y_test_seq = y_test.iloc[seq_len:]
+        else:
+            # classical models
+            dates_test_seq = dates_test
+            prices_test_seq = prices_test
+            y_test_seq = y_test
 
+
+        acc = model.evaluate_and_plot(df, y_test_seq, y_pred, X, dates_test_seq, prices_test_seq)
         # Update best model
         if acc > best_acc:
             best_acc = acc
