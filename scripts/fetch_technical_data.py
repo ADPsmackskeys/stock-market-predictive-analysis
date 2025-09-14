@@ -1,75 +1,60 @@
-# Fetch Technical Data along with important indicators for all stocks present in TICKERS
-import yfinance as yf
 import pandas as pd
-import talib
-import os, sys
-from datetime import datetime, timedelta
 import numpy as np
+import glob
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import class_weight
+import pickle
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from config.tickers import TICKERS
+seq_len = 30
+feature_cols = ['Open','High','Low','Close','Volume','SMA_20','SMA_50','EMA_20','EMA_50',
+                'RSI_14','MACD','MACD_Signal','MACD_Hist','BB_upper','BB_middle','BB_lower',
+                'ATR_14','STOCH_K','STOCH_D','OBV','CCI_20','Williams_%R','VWAP','CMF_20']
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'technical')
-os.makedirs(DATA_DIR, exist_ok=True)
+all_sequences = []
+all_labels = []
 
-def add_indicators(df):
-    close = df["Close"].astype(float).values
-    high = df["High"].astype(float).values
-    low = df["Low"].astype(float).values
-    volume = df["Volume"].astype(float).values
+csv_files = glob.glob("D:/VIT/Project/stock-market-predictive-analysis/data/technical/*.csv")
+for file in csv_files:
+    df = pd.read_csv(file)
+    df = df.sort_values('Date')
+    df[feature_cols] = df[feature_cols].fillna(method='bfill').fillna(method='ffill')
 
-    # --- TA-Lib Indicators ---
-    df["SMA_20"] = talib.SMA(close, timeperiod=20)
-    df["SMA_50"] = talib.SMA(close, timeperiod=50)
-    df["EMA_20"] = talib.EMA(close, timeperiod=20)
-    df["EMA_50"] = talib.EMA(close, timeperiod=50)
-    df["RSI_14"] = talib.RSI(close, timeperiod=14)
-    df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-    df["BB_upper"], df["BB_middle"], df["BB_lower"] = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
-    df["ATR_14"] = talib.ATR(high, low, close, timeperiod=14)
-    df["STOCH_K"], df["STOCH_D"] = talib.STOCH(high, low, close, fastk_period=14, slowk_period=3, slowd_period=3)
-    df["OBV"] = talib.OBV(close, volume)
-    df["CCI_20"] = talib.CCI(high, low, close, timeperiod=20)
-    df["Williams_%R"] = talib.WILLR(high, low, close, timeperiod=14)
+    if len(df) < seq_len + 1:
+        continue
 
-    # --- Manual Indicators ---
-    df["VWAP"] = (df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3).cumsum() / df["Volume"].cumsum()
-    mfm = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / (df["High"] - df["Low"])
-    mfm = mfm.replace([np.inf, -np.inf], np.nan).fillna(0)
-    mfv = mfm * df["Volume"]
-    df["CMF_20"] = mfv.rolling(20).sum() / df["Volume"].rolling(20).sum()
+    df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+    df = df[:-1]
 
-    df.dropna(inplace=True)
-    return df
+    for i in range(len(df) - seq_len + 1):
+        seq = df[feature_cols].iloc[i:i+seq_len].values
+        label = df['Target'].iloc[i+seq_len-1]
+        all_sequences.append(seq)
+        all_labels.append(label)
 
-def clean_dataframe(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df.reset_index(inplace=True)
-    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+# Convert to NumPy arrays
+X = np.array(all_sequences, dtype=np.float32)
+y = np.array(all_labels, dtype=np.int8)
 
-def fetch_historical_data(ticker, years=5):
-    """Fetch historical data and compute indicators."""
-    file_path = os.path.join(DATA_DIR, f"{ticker}_data.csv")
-    end = datetime.today()
-    start = end - timedelta(days=365 * years)
+# Normalize features
+n_samples, n_timesteps, n_features = X.shape
+scaler = StandardScaler()
+X_reshaped = X.reshape(-1, n_features)
+X_scaled = scaler.fit_transform(X_reshaped)
+X_scaled = X_scaled.reshape(n_samples, n_timesteps, n_features)
 
-    try:
-        df = yf.download(f"{ticker}.NS", start=start.strftime('%Y-%m-%d'), end=end.strftime('%Y-%m-%d'))
-        if df.empty:
-            print(f"No data for {ticker}")
-            return
+# Compute class weights
+classes = np.unique(y)
+weights = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=y)
+class_weights = dict(zip(classes, weights))
 
-        df = clean_dataframe(df)
-        df = add_indicators(df)
-        df.to_csv(file_path, index=False)
-        print(f"Saved {ticker} data ({len(df)} rows)")
-    except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
+# Optional: save to disk to avoid memory issues
+with open("X_scaled.pkl", "wb") as f:
+    pickle.dump(X_scaled, f)
+with open("y.pkl", "wb") as f:
+    pickle.dump(y, f)
+with open("class_weights.pkl", "wb") as f:
+    pickle.dump(class_weights, f)
 
-if __name__ == "__main__":
-    for ticker in TICKERS:
-        fetch_historical_data(ticker)
-
-    with open(os.path.join(DATA_DIR, ".init_done"), "w") as f:
-        f.write("Historical fetch complete with indicators")
+print("X shape:", X_scaled.shape)
+print("y shape:", y.shape)
+print("Class weights:", class_weights)

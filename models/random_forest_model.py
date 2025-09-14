@@ -1,5 +1,5 @@
 from sklearn.ensemble import RandomForestClassifier
-from models.baseline_unimodal import BaseModel
+from models.base_model import BaseModel
 
 class RandomForestModel(BaseModel):
     def build_model(self):
