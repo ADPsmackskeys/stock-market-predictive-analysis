@@ -1,28 +1,36 @@
-import random
+import requests
+from bs4 import BeautifulSoup
 
-import time
-try:
-	from googlesearch import search
-except ImportError: 
-	print("No module named 'google' found")
+base_sitemap = "https://www.moneycontrol.com/news/sitemap/sitemap-post-{}-{}.xml"
+keyword = "stocks-to-watch-today"
+all_urls = []
 
-user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/15.1 Safari/605.1.15",
-    "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/119.0.0.0 Mobile Safari/537.36"
-]
+for year in range(2021, 2026):
+    for month in range(1, 13):
+        if year == 2025 and month > 9:
+            break
 
-headers = {
-    "User-Agent": random.choice(user_agents)
-}
+        sitemap_url = base_sitemap.format(year, str(month).zfill(2))
+        # print(f"Processing {sitemap_url} ...")
 
+        try:
+            response = requests.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if response.status_code != 200:
+                # print(f"Failed to fetch {sitemap_url}, status: {response.status_code}")
+                continue
 
-# to search
-query = "site:www.moneycontrol.com inurl:stocks-to-watch"
-searchlist = []
+            soup = BeautifulSoup(response.content, "xml")  # parse as XML
 
-for j in search (query, num_results = 1000, region = "in", lang = "en", headers = headers):
-	searchlist.append (j)
-	time.sleep (0.2)
+            for loc_tag in soup.find_all("loc"):
+                loc = loc_tag.text.strip()
+                if keyword in loc:
+                    all_urls.append(loc)
 
+        except Exception as e:
+            print(f"Error fetching {sitemap_url}: {e}")
+
+# Deduplicate
+searchlist = list(set(all_urls))
+
+print(f"\nTotal 'stocks-to-watch-today' articles found: {len(searchlist)}")
 
