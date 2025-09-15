@@ -2151,6 +2151,8 @@ stocks = {
 
 cnt = 0
 data = []
+newslist = []
+
 for k in searchlist:
     cnt += 1
     print ("Link ", cnt)
@@ -2186,7 +2188,8 @@ for k in searchlist:
 
         for i in range(len(sentences) - 1):
             company_name = sentences[i].strip()
-            news_text = sentences[i+1].strip()
+            news_text = sentences[i + 1].strip()
+            newslist.append (news_text)
 
         for key in stocks.keys():
             if (company_name.lower ()) in (key.lower ()) and "Q1 (Consolidated" not in news_text[-1]:
@@ -2202,5 +2205,5 @@ for k in searchlist:
 
 
 df = pd.DataFrame(data)
-df.to_csv("/data/news-sentiment/stocks_news.csv", index = False, encoding = "utf-8-sig")
+df.to_csv("data/news_sentiment/stocks_news.csv", index = False, encoding = "utf-8-sig")
 print("Saved to stocks_news.csv")
