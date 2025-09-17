@@ -7,7 +7,7 @@ from models.catboost_model import CatBoostModel
 from models.logistic_regression_model import LogisticRegressionModel
 from models.random_forest_model import RandomForestModel
 from models.xgboost_model import XGBoostModel
-from models.baseline_unimodal import BaseModel
+from models.base_model import BaseModel
 
 MODEL_CLASSES = [
     CatBoostModel,
@@ -21,15 +21,21 @@ data_dir = os.path.join(project_root, "data", "technical")
 reports_dir = os.path.join(project_root, "reports")
 os.makedirs(reports_dir, exist_ok=True)
 
-# Only include tickers for which CSV exists
-available_tickers = [t for t in TICKERS if os.path.exists(os.path.join(data_dir, f"{t}_data.csv"))]
-print(f"Tickers with CSVs: {available_tickers}")
+staged_file = os.path.join(reports_dir, "staged_run.txt")
+processed_tickers = set()
+if os.path.exists(staged_file):
+    with open(staged_file, "r") as f:
+        processed_tickers = set(line.strip() for line in f if line.strip())
 
-# Prepare summary dataframe
-summary = []
+available_tickers = [t for t in TICKERS if os.path.exists(os.path.join(data_dir, f"{t}_data.csv"))]
+available_tickers = [t for t in available_tickers if t not in processed_tickers]
+print(f"Tickers to process: {available_tickers}")
+
+overall_summary = []
 
 for ticker in available_tickers:
     print(f"\n=== Evaluating models for {ticker} ===")
+
     ticker_report_dir = os.path.join(reports_dir, ticker)
     os.makedirs(ticker_report_dir, exist_ok=True)
 
@@ -37,18 +43,21 @@ for ticker in available_tickers:
     best_model_name = None
 
     for ModelClass in MODEL_CLASSES:
-        model_name = ModelClass.__name__.replace('Model', '')
+        model_name = ModelClass.__name__.replace("Model", "")
         print(f"\n--- Running {model_name} ---")
-        model = ModelClass(ticker, data_dir, ticker_report_dir)
+        model = ModelClass(ticker)
         model.build_model()
 
         # Load data
         df = model.load_data()
-
-        # Create label
         df["Label"] = df["Close"].shift(-1) > df["Close"]
         df["Label"] = df["Label"].map({True: "Increase", False: "Decrease"})
         df.dropna(inplace=True)
+
+        # Skip if not enough data
+        if df.empty or len(df) < 10:
+            print(f"Skipping {ticker}: insufficient data")
+            break
 
         X = df.drop(columns=["Date", "Label"])
         y = df["Label"]
@@ -61,32 +70,32 @@ for ticker in available_tickers:
         dates_test = df["Date"].iloc[y_test.index]
         prices_test = df["Close"].iloc[y_test.index]
 
-        if hasattr(model, "seq_len"):
-            seq_len = model.seq_len
-            dates_test_seq = dates_test.iloc[seq_len:]
-            prices_test_seq = prices_test.iloc[seq_len:]
-            y_test_seq = y_test.iloc[seq_len:]
-        else:
-            # classical models
-            dates_test_seq = dates_test
-            prices_test_seq = prices_test
-            y_test_seq = y_test
+        acc = model.evaluate_and_plot(df, y_test, y_pred, X, dates_test, prices_test)
 
-
-        acc = model.evaluate_and_plot(df, y_test_seq, y_pred, X, dates_test_seq, prices_test_seq)
-        # Update best model
         if acc > best_acc:
             best_acc = acc
             best_model_name = model_name
 
-    print(f"\n*** Best model for {ticker}: {best_model_name} with accuracy {best_acc:.4f} ***")
-    summary.append({"Ticker": ticker, "Best Model": best_model_name, "Accuracy": best_acc})
+    if best_model_name:
+        summary_df = pd.DataFrame([{
+            "Ticker": ticker,
+            "Best Model": best_model_name,
+            "Accuracy": best_acc
+        }])
+        summary_csv_path = os.path.join(ticker_report_dir, f"{ticker}_best_model_summary.csv")
+        summary_df.to_csv(summary_csv_path, index=False)
+        print(f"Saved summary for {ticker} at: {summary_csv_path}")
 
-# Save summary to CSV
-summary_df = pd.DataFrame(summary)
-summary_csv_path = os.path.join(reports_dir, "best_model_summary.csv")
-summary_df.to_csv(summary_csv_path, index=False)
-print(f"\nSummary of best models saved to: {summary_csv_path}")
+        overall_summary.append({"Ticker": ticker, "Best Model": best_model_name, "Accuracy": best_acc})
 
-# Print overall average accuracy
-BaseModel.print_average_accuracy()
+        # Mark ticker as processed
+        with open(staged_file, "a") as f:
+            f.write(f"{ticker}\n")
+
+# Save overall summary
+overall_summary_df = pd.DataFrame(overall_summary)
+overall_summary_csv = os.path.join(reports_dir, "overall_best_model_summary.csv")
+overall_summary_df.to_csv(overall_summary_csv, index=False)
+print(f"\nOverall best model summary saved to: {overall_summary_csv}")
+
+BaseModel.print_average_scores()

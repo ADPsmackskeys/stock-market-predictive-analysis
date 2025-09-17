@@ -1,4 +1,3 @@
-'''
 stocks = {
   "20 Microns Limited": "20MICRONS",
   "21st Century Management Services Limited": "21STCENMGM",
@@ -2139,58 +2138,5 @@ stocks = {
   "Zydus Wellness Limited": "ZYDUSWELL"
 }
 
-'''
-stocks = {
-      "20 Microns Limited": "20MICRONS",
-  "21st Century Management Services Limited": "21STCENMGM",
-  "360 ONE WAM LIMITED": "360ONE",
-  "3i Infotech Limited": "3IINFOLTD",
-  "3M India Limited": "3MINDIA",
-  "3P Land Holdings Limited": "3PLAND",
-  "5Paisa Capital Limited": "5PAISA",
-  "63 moons technologies limited": "63MOONS",
-  "A2Z Infra Engineering Limited": "A2ZINFRA",
-  "AAA Technologies Limited": "AAATECH",
-  "Aadhar Housing Finance Limited": "AADHARHFC",
-  "Aakash Exploration Services Limited": "AAKASH",
-  "Aarey Drugs & Pharmaceuticals Limited": "AAREYDRUGS",
-  "Aaron Industries Limited": "AARON",
-  "Aartech Solonics Limited": "AARTECH",
-  "Aarti Drugs Limited": "AARTIDRUGS",
-  "Aarti Industries Limited": "AARTIIND",
-  "Aarti Pharmalabs Limited": "AARTIPHARM",
-  "Aarti Surfactants Limited": "AARTISURF",
-  "Aarvee Denims & Exports Limited": "AARVEEDEN",
-  "Aarvi Encon Limited": "AARVI",
-  "Aavas Financiers Limited": "AAVAS",
-  "Aban Offshore Limited": "ABAN",
-  "ABB India Limited": "ABB",
-  "Abbott India Limited": "ABBOTINDIA",
-  "Aditya Birla Capital Limited": "ABCAPITAL",
-  "Allied Blenders and Distillers Limited": "ABDL",
-  "Aditya Birla Fashion and Retail Limited": "ABFRL",
-  "A B Infrabuild Limited": "ABINFRA",
-  "ABM International Limited": "ABMINTLLTD",
-  "Aditya Birla Real Estate Limited": "ABREL",
-  "Aditya Birla Sun Life AMC Limited": "ABSLAMC",
-  "ACC Limited": "ACC",
-  "Accelya Solutions India Limited": "ACCELYA",
-  "Accuracy Shipping Limited": "ACCURACY",
-  "Action Construction Equipment Limited": "ACE",
-  "Ace Integrated Solutions Limited": "ACEINTEG",
-  "Archean Chemical Industries Limited": "ACI",
-  "Andhra Cements Limited": "ACL",
-  "Allcargo Gati Limited": "ACLGATI",
-  "Acme Solar Holdings Limited": "ACMESOLAR",
-  "Acutaas Chemicals Limited": "ACUTAAS",
-  "Adani Energy Solutions Limited": "ADANIENSOL",
-  "Adani Enterprises Limited": "ADANIENT",
-  "Adani Green Energy Limited": "ADANIGREEN",
-  "Adani Ports and Special Economic Zone Limited": "ADANIPORTS",
-  "Adani Power Limited": "ADANIPOWER",
-  "ADF Foods Limited": "ADFFOODS",
-  "Archidply Decor Limited": "ADL",
-  "Ador Welding Limited": "ADOR",
-  "Adroit Infotech Limited": "ADROITINFO"
-}
+
 TICKERS = list(stocks.values())
