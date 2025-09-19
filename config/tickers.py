@@ -1097,7 +1097,6 @@ stocks = {
   "Linc Limited": "LINC",
   "Lincoln Pharmaceuticals Limited": "LINCOLN",
   "Linde India Limited": "LINDEINDIA",
-  "Lloyds Enterprises Limited-RE": "LLOYDSE-RE",
   "LLOYDS ENGINEERING WORKS LIMITED": "LLOYDSENGG",
   "Lloyds Enterprises Limited": "LLOYDSENT",
   "Lloyds Metals And Energy Limited": "LLOYDSME",
