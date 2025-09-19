@@ -1,60 +1,96 @@
+import os
 import pandas as pd
-import numpy as np
-import glob
-from sklearn.preprocessing import StandardScaler
-from sklearn.utils import class_weight
-import pickle
+import yfinance as yf
+import talib as ta
+from datetime import datetime
+from config.tickers import TICKERS   
 
-seq_len = 30
-feature_cols = ['Open','High','Low','Close','Volume','SMA_20','SMA_50','EMA_20','EMA_50',
-                'RSI_14','MACD','MACD_Signal','MACD_Hist','BB_upper','BB_middle','BB_lower',
-                'ATR_14','STOCH_K','STOCH_D','OBV','CCI_20','Williams_%R','VWAP','CMF_20']
+DATA_DIR = "data/technical"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-all_sequences = []
-all_labels = []
+failed_tickers = []
 
-csv_files = glob.glob("D:/VIT/Project/stock-market-predictive-analysis/data/technical/*.csv")
-for file in csv_files:
-    df = pd.read_csv(file)
-    df = df.sort_values('Date')
-    df[feature_cols] = df[feature_cols].fillna(method='bfill').fillna(method='ffill')
+def add_indicators(df):
+    close = df["Close"].astype(float).values
+    high = df["High"].astype(float).values
+    low = df["Low"].astype(float).values
+    volume = df["Volume"].astype(float).values
 
-    if len(df) < seq_len + 1:
-        continue
+    df["SMA_20"] = ta.SMA(close, timeperiod=20)
+    df["SMA_50"] = ta.SMA(close, timeperiod=50)
+    df["EMA_20"] = ta.EMA(close, timeperiod=20)
+    df["EMA_50"] = ta.EMA(close, timeperiod=50)
+    df["RSI_14"] = ta.RSI(close, timeperiod=14)
 
-    df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-    df = df[:-1]
+    macd, macdsignal, macdhist = ta.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    df["MACD"] = macd
+    df["MACD_Signal"] = macdsignal
+    df["MACD_Hist"] = macdhist
 
-    for i in range(len(df) - seq_len + 1):
-        seq = df[feature_cols].iloc[i:i+seq_len].values
-        label = df['Target'].iloc[i+seq_len-1]
-        all_sequences.append(seq)
-        all_labels.append(label)
+    upper, middle, lower = ta.BBANDS(close, timeperiod=20)
+    df["BB_upper"] = upper
+    df["BB_middle"] = middle
+    df["BB_lower"] = lower
 
-# Convert to NumPy arrays
-X = np.array(all_sequences, dtype=np.float32)
-y = np.array(all_labels, dtype=np.int8)
+    df["ATR_14"] = ta.ATR(high, low, close, timeperiod=14)
 
-# Normalize features
-n_samples, n_timesteps, n_features = X.shape
-scaler = StandardScaler()
-X_reshaped = X.reshape(-1, n_features)
-X_scaled = scaler.fit_transform(X_reshaped)
-X_scaled = X_scaled.reshape(n_samples, n_timesteps, n_features)
+    slowk, slowd = ta.STOCH(high, low, close)
+    df["STOCH_K"] = slowk
+    df["STOCH_D"] = slowd
 
-# Compute class weights
-classes = np.unique(y)
-weights = class_weight.compute_class_weight(class_weight="balanced", classes=classes, y=y)
-class_weights = dict(zip(classes, weights))
+    df["OBV"] = ta.OBV(close, volume)
 
-# Optional: save to disk to avoid memory issues
-with open("X_scaled.pkl", "wb") as f:
-    pickle.dump(X_scaled, f)
-with open("y.pkl", "wb") as f:
-    pickle.dump(y, f)
-with open("class_weights.pkl", "wb") as f:
-    pickle.dump(class_weights, f)
+    df["CCI_20"] = ta.CCI(high, low, close, timeperiod=20)
 
-print("X shape:", X_scaled.shape)
-print("y shape:", y.shape)
-print("Class weights:", class_weights)
+    df["Williams_%R"] = ta.WILLR(high, low, close, timeperiod=14)
+
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+    df["VWAP"] = (typical_price * df["Volume"]).cumsum() / df["Volume"].cumsum()
+
+    mf_multiplier = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / (df["High"] - df["Low"])
+    mf_volume = mf_multiplier * df["Volume"]
+    df["CMF_20"] = mf_volume.rolling(20).sum() / df["Volume"].rolling(20).sum()
+
+    return df
+
+
+for ticker in TICKERS:
+    file_path = os.path.join(DATA_DIR, f"{ticker}_data.csv")
+    print(f"Processing {ticker}")
+
+    try:
+        yf_ticker = f"{ticker}.NS" if not ticker.endswith((".NS", ".BO")) else ticker
+        new_df = yf.download(yf_ticker, period="5y", interval="1d", auto_adjust=False, progress=False)
+
+        if new_df.empty:
+            print(f"No data for {ticker}")
+            failed_tickers.append(ticker)
+            continue
+
+        if isinstance(new_df.columns, pd.MultiIndex):
+            new_df.columns = [c[0] for c in new_df.columns]
+
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
+
+        new_df = new_df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if new_df.empty:
+            print(f"No valid rows for {ticker}")
+            failed_tickers.append(ticker)
+            continue
+
+        new_df.reset_index(inplace=True)
+        new_df = add_indicators(new_df)
+
+        if os.path.exists(file_path):
+            old_df = pd.read_csv(file_path, parse_dates=["Date"])
+            combined = pd.concat([old_df, new_df]).drop_duplicates(subset=["Date"]).sort_values("Date")
+            combined.to_csv(file_path, index=False)
+        else:
+            new_df.to_csv(file_path, index=False)
+
+    except Exception as e:
+        print(f"Error for {ticker}: {e}")
+        failed_tickers.append(ticker)
+
+print("\nFailed Tickers:", failed_tickers)
