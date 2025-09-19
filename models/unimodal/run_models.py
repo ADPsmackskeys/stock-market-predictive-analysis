@@ -1,101 +1,117 @@
 import os
+import glob
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from config.tickers import TICKERS
+import numpy as np
+import matplotlib.pyplot as plt
 
-from models.unimodal.catboost_model import CatBoostModel
-from models.unimodal.logistic_regression_model import LogisticRegressionModel
-from models.unimodal.random_forest_model import RandomForestModel
-from models.unimodal.xgboost_model import XGBoostModel
-from models.unimodal.base_model import BaseModel
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.neural_network import MLPRegressor
 
-MODEL_CLASSES = [
-    CatBoostModel,
-    LogisticRegressionModel,
-    RandomForestModel,
-    XGBoostModel
-]
+DATA_DIR = "data/technical"
+REPORT_DIR = "reports/unimodal"
+os.makedirs(REPORT_DIR, exist_ok=True)
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-data_dir = os.path.join(project_root, "data", "technical")
-reports_dir = os.path.join(project_root, "reports", "unimodal")
-os.makedirs(reports_dir, exist_ok=True)
+TRAIN_END = "2025-05-31"
+TEST_START = "2025-06-01"
+TEST_END = "2025-09-30"
 
-staged_file = os.path.join(reports_dir, "staged_run.txt")
-processed_tickers = set()
-if os.path.exists(staged_file):
-    with open(staged_file, "r") as f:
-        processed_tickers = set(line.strip() for line in f if line.strip())
+models = {
+    "Ridge": Ridge(),
+    "Lasso": Lasso(),
+    "RandomForest": RandomForestRegressor(n_estimators=200, random_state=42),
+    "XGBoost": XGBRegressor(n_estimators=200, random_state=42),
+    "MLP": MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+}
 
-available_tickers = [t for t in TICKERS if os.path.exists(os.path.join(data_dir, f"{t}_data.csv"))]
-available_tickers = [t for t in available_tickers if t not in processed_tickers]
-print(f"Tickers to process: {available_tickers}")
+summary_rows = []
 
-overall_summary = []
+# -----------------------------
+# Function: Train + Evaluate
+# -----------------------------
+def evaluate_stock(file_path):
+    ticker = os.path.basename(file_path).replace("_data.csv", "")
+    print(f"\nProcessing {ticker}...")
 
-for ticker in available_tickers:
-    print(f"\n=== Evaluating models for {ticker} ===")
+    df = pd.read_csv(file_path, parse_dates=["Date"])
+    df = df.sort_values("Date")
 
-    ticker_report_dir = os.path.join(reports_dir, ticker)
-    os.makedirs(ticker_report_dir, exist_ok=True)
+    # Use Close price + indicators (drop Adj Close if present)
+    features = [c for c in df.columns if c not in ["Date", "Close", "Adj Close"]]
+    target = "Close"
 
-    best_acc = -1
-    best_model_name = None
+    # Split train/test
+    train_df = df[df["Date"] <= TRAIN_END]
+    test_df = df[(df["Date"] >= TEST_START) & (df["Date"] <= TEST_END)]
 
-    for ModelClass in MODEL_CLASSES:
-        model_name = ModelClass.__name__.replace("Model", "")
-        print(f"\n--- Running {model_name} ---")
-        model = ModelClass(ticker)
-        model.build_model()
+    if train_df.empty or test_df.empty:
+        print(f"Skipping {ticker} (insufficient data)")
+        return
 
-        # Load data
-        df = model.load_data()
-        df["Label"] = df["Close"].shift(-1) > df["Close"]
-        df["Label"] = df["Label"].map({True: "Increase", False: "Decrease"})
-        df.dropna(inplace=True)
+    X_train, y_train = train_df[features], train_df[target]
+    X_test, y_test = test_df[features], test_df[target]
 
-        # Skip if not enough data
-        if df.empty or len(df) < 10:
-            print(f"Skipping {ticker}: insufficient data")
-            break
+    # Normalize features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
-        X = df.drop(columns=["Date", "Label"])
-        y = df["Label"]
+    best_model = None
+    best_rmse = float("inf")
+    best_preds = None
+    best_name = None
+    best_mape = None
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    # Try all models
+    for name, model in models.items():
+        try:
+            model.fit(X_train_scaled, y_train)
+            preds = model.predict(X_test_scaled)
 
-        model.train(X_train, y_train)
-        y_pred = model.predict(X_test)
+            rmse = mean_squared_error(y_test, preds, squared=False)
+            mape = mean_absolute_percentage_error(y_test, preds)
 
-        dates_test = df["Date"].iloc[y_test.index]
-        prices_test = df["Close"].iloc[y_test.index]
+            print(f"  {name}: RMSE={rmse:.2f}, MAPE={mape:.2%}")
 
-        acc = model.evaluate_and_plot(df, y_test, y_pred, X, dates_test, prices_test)
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_mape = mape
+                best_model = model
+                best_preds = preds
+                best_name = name
+        except Exception as e:
+            print(f"  Skipped {name} due to error: {e}")
 
-        if acc > best_acc:
-            best_acc = acc
-            best_model_name = model_name
+    # Save plot
+    plt.figure(figsize=(10, 5))
+    plt.plot(test_df["Date"], y_test, label="Actual", color="black")
+    plt.plot(test_df["Date"], best_preds, label=f"Predicted ({best_name})", linestyle="--")
+    plt.title(f"{ticker}: Actual vs Predicted Closing Price (Jun–Sep 2025)")
+    plt.xlabel("Date")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(REPORT_DIR, f"{ticker}_prediction.png"))
+    plt.close()
 
-    if best_model_name:
-        summary_df = pd.DataFrame([{
-            "Ticker": ticker,
-            "Best Model": best_model_name,
-            "Accuracy": best_acc
-        }])
-        summary_csv_path = os.path.join(ticker_report_dir, f"{ticker}_best_model_summary.csv")
-        summary_df.to_csv(summary_csv_path, index=False)
-        print(f"Saved summary for {ticker} at: {summary_csv_path}")
+    # Add summary
+    summary_rows.append([ticker, best_name, best_rmse, best_mape])
 
-        overall_summary.append({"Ticker": ticker, "Best Model": best_model_name, "Accuracy": best_acc})
+# -----------------------------
+# Main Loop
+# -----------------------------
+if __name__ == "__main__":
+    csv_files = glob.glob(os.path.join(DATA_DIR, "*_data.csv"))
 
-        # Mark ticker as processed
-        with open(staged_file, "a") as f:
-            f.write(f"{ticker}\n")
+    for file_path in csv_files:
+        evaluate_stock(file_path)
 
-# Save overall summary
-overall_summary_df = pd.DataFrame(overall_summary)
-overall_summary_csv = os.path.join(reports_dir, "overall_best_model_summary.csv")
-overall_summary_df.to_csv(overall_summary_csv, index=False)
-print(f"\nOverall best model summary saved to: {overall_summary_csv}")
-
-BaseModel.print_average_scores()
+    # Save summary
+    summary_df = pd.DataFrame(summary_rows, columns=["Ticker", "BestModel", "RMSE", "MAPE"])
+    summary_df.to_csv(os.path.join(REPORT_DIR, "summary.csv"), index=False)
+    print("\n=== Benchmark Report Generated ===")
+    print(summary_df)
