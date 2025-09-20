@@ -1,16 +1,18 @@
 import os
 import glob
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
-
-from sklearn.model_selection import TimeSeriesSplit
+import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+from sklearn.metrics import mean_absolute_percentage_error, root_mean_squared_error
 from sklearn.linear_model import Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
 from sklearn.neural_network import MLPRegressor
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 DATA_DIR = "data/technical"
 REPORT_DIR = "reports/unimodal"
@@ -30,21 +32,17 @@ models = {
 
 summary_rows = []
 
-# -----------------------------
-# Function: Train + Evaluate
-# -----------------------------
+
 def evaluate_stock(file_path):
     ticker = os.path.basename(file_path).replace("_data.csv", "")
-    print(f"\nProcessing {ticker}...")
+    print(f"\nProcessing {ticker}")
 
     df = pd.read_csv(file_path, parse_dates=["Date"])
     df = df.sort_values("Date")
 
-    # Use Close price + indicators (drop Adj Close if present)
     features = [c for c in df.columns if c not in ["Date", "Close", "Adj Close"]]
     target = "Close"
 
-    # Split train/test
     train_df = df[df["Date"] <= TRAIN_END]
     test_df = df[(df["Date"] >= TEST_START) & (df["Date"] <= TEST_END)]
 
@@ -52,27 +50,30 @@ def evaluate_stock(file_path):
         print(f"Skipping {ticker} (insufficient data)")
         return
 
-    X_train, y_train = train_df[features], train_df[target]
-    X_test, y_test = test_df[features], test_df[target]
+    X_train, y_train = train_df[features].copy(), train_df[target].copy()
+    X_test, y_test = test_df[features].copy(), test_df[target].copy()
 
-    # Normalize features
+    X_train.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X_test.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X_train = X_train.ffill().fillna(0)
+    X_test = X_test.ffill().fillna(0)
+
+
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    best_model = None
     best_rmse = float("inf")
     best_preds = None
     best_name = None
     best_mape = None
 
-    # Try all models
     for name, model in models.items():
         try:
             model.fit(X_train_scaled, y_train)
             preds = model.predict(X_test_scaled)
 
-            rmse = mean_squared_error(y_test, preds, squared=False)
+            rmse = root_mean_squared_error(y_test, preds)
             mape = mean_absolute_percentage_error(y_test, preds)
 
             print(f"  {name}: RMSE={rmse:.2f}, MAPE={mape:.2%}")
@@ -80,7 +81,6 @@ def evaluate_stock(file_path):
             if rmse < best_rmse:
                 best_rmse = rmse
                 best_mape = mape
-                best_model = model
                 best_preds = preds
                 best_name = name
         except Exception as e:
@@ -98,12 +98,9 @@ def evaluate_stock(file_path):
     plt.savefig(os.path.join(REPORT_DIR, f"{ticker}_prediction.png"))
     plt.close()
 
-    # Add summary
     summary_rows.append([ticker, best_name, best_rmse, best_mape])
 
-# -----------------------------
-# Main Loop
-# -----------------------------
+
 if __name__ == "__main__":
     csv_files = glob.glob(os.path.join(DATA_DIR, "*_data.csv"))
 
@@ -113,5 +110,5 @@ if __name__ == "__main__":
     # Save summary
     summary_df = pd.DataFrame(summary_rows, columns=["Ticker", "BestModel", "RMSE", "MAPE"])
     summary_df.to_csv(os.path.join(REPORT_DIR, "summary.csv"), index=False)
-    print("\n=== Benchmark Report Generated ===")
+    print("\nBenchmark Report Generated")
     print(summary_df)
