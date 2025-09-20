@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import talib as ta
 from datetime import datetime
-from config.tickers import TICKERS  # adjust your import if needed
+from config.tickers import TICKERS  
 
 DATA_DIR = "data/technical"
 os.makedirs(DATA_DIR, exist_ok=True)
