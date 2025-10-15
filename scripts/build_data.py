@@ -2,7 +2,7 @@ import pandas as pd
 import os
 
 # ----------------- CONFIG -----------------
-NEWS_FILE = "data/news_sentiment/stocks_news.csv"      # News CSV with 'Symbol', 'Date', 'News'
+NEWS_FILE = "data/news_sentiment/stocks_news_new.csv"      # News CSV with 'Symbol', 'Date', 'News'
 OHLC_FOLDER = "data/technical"                         # Folder containing OHLC CSVs for each stock
 OUTPUT_FILE = "data/news_sentiment/labeled_news.csv"   # Output labeled CSV
 NEUTRAL_THRESHOLD = 0.002                              # ±0.2% threshold for neutral
