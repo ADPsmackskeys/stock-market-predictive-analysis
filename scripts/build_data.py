@@ -11,24 +11,26 @@ NEUTRAL_THRESHOLD = 0.002                              # ±0.2% threshold for ne
 # Load news dataset
 news_df = pd.read_csv(NEWS_FILE, parse_dates=["Date"])
 
-# Helper: find next trading date in OHLC data
-def get_next_trading_date(news_date, ohlc_df):
+# Helper: find same-day or next available trading date in OHLC data
+def get_valid_trading_date(news_date, ohlc_df):
+    if news_date in ohlc_df.index:
+        return news_date
     future_dates = ohlc_df.index[ohlc_df.index > news_date]
     return future_dates[0] if len(future_dates) > 0 else None
 
-# Helper: label sentiment based on intraday move (next close vs next open)
+# Helper: label sentiment based on intraday move (same-day open → close)
 def label_sentiment(news_date, ohlc_df):
-    next_date = get_next_trading_date(news_date, ohlc_df)
-    if next_date is None:
+    valid_date = get_valid_trading_date(news_date, ohlc_df)
+    if valid_date is None:
         return None
 
     try:
-        next_open = ohlc_df.loc[next_date]["Open"]   # open on next trading day
-        next_close = ohlc_df.loc[next_date]["Close"] # close on next trading day
+        day_open = ohlc_df.loc[valid_date]["Open"]
+        day_close = ohlc_df.loc[valid_date]["Close"]
     except Exception:
         return None
 
-    pct_change = (next_close - next_open) / next_open
+    pct_change = (day_close - day_open) / day_open
 
     if abs(pct_change) <= NEUTRAL_THRESHOLD:
         return "Neutral"
