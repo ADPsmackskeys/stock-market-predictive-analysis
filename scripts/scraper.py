@@ -3,8 +3,10 @@ from searcher import searchlist
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
-from  config.tickers import stocks #To those wondering about this. Go check config.tickers.py
-from htmldate import find_date
+import sys
+sys.path.insert(1, './config')
+from tickers import stocks # To those wondering about this. Go check config/tickers.py. 
+from htmldate import find_date # Noted. Thanks for doing it. Fixed it a bit (We can't treat folders as modules. And there was no space after the # <3)
 
 def normalize (name):
     return re.sub(r'[^A-Za-z0-9 ]+', '', name).strip ().lower ()
