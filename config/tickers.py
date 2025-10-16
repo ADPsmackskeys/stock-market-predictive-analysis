@@ -2139,4 +2139,3 @@ stocks = {
 
 
 TICKERS = list(stocks.values())
-colab = "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"
