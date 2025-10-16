@@ -18,20 +18,8 @@ def get_valid_trading_date(news_date, ohlc_df):
     future_dates = ohlc_df.index[ohlc_df.index > news_date]
     return future_dates[0] if len(future_dates) > 0 else None
 
-# Helper: label sentiment based on intraday move (same-day open → close)
-def label_sentiment(news_date, ohlc_df):
-    valid_date = get_valid_trading_date(news_date, ohlc_df)
-    if valid_date is None:
-        return None
-
-    try:
-        day_open = ohlc_df.loc[valid_date]["Open"]
-        day_close = ohlc_df.loc[valid_date]["Close"]
-    except Exception:
-        return None
-
-    pct_change = (day_close - day_open) / day_open
-
+# Helper: create a single label from a percentage change
+def create_label(pct_change):
     if abs(pct_change) <= NEUTRAL_THRESHOLD:
         return "Neutral"
     elif pct_change > 0:
@@ -39,9 +27,44 @@ def label_sentiment(news_date, ohlc_df):
     else:
         return "Negative"
 
+# --- NEW FUNCTION ---
+# Get labels for multiple time horizons (T+1, T+2, T+5 trading sessions)
+def get_labels_for_horizons(news_date, ohlc_df):
+    start_date = get_valid_trading_date(news_date, ohlc_df)
+    if start_date is None:
+        return None
+
+    try:
+        # Find the integer index location of our starting date
+        start_loc = ohlc_df.index.get_loc(start_date)
+        start_open = ohlc_df.iloc[start_loc]["Open"]
+    except KeyError:
+        return None # Should not happen due to get_valid_trading_date, but good practice
+
+    labels = {}
+
+    # Define horizons in terms of trading sessions from the start date
+    # T+1: Open of start_date -> Close of start_date (index offset 0)
+    # T+2: Open of start_date -> Close of next day (index offset 1)
+    # T+3: Open of start_date -> Close of day after that (index offset 2)
+    horizons = {"T1": 0, "T2": 1, "T3": 2}
+
+    for name, offset in horizons.items():
+        try:
+            # Find the closing price for the target future date
+            future_close = ohlc_df.iloc[start_loc + offset]["Close"]
+            pct_change = (future_close - start_open) / start_open
+            labels[f"Label_{name}"] = create_label(pct_change)
+        except IndexError:
+            # This happens if the news is too close to the end of the OHLC data
+            labels[f"Label_{name}"] = None
+
+    return labels
+
 # Process all news
 final_data = []
 
+# --- MODIFIED MAIN LOOP ---
 for idx, row in news_df.iterrows():
     company = row["Symbol"].strip()
     news_date = pd.to_datetime(row["Date"])
@@ -53,48 +76,22 @@ for idx, row in news_df.iterrows():
         continue
 
     ohlc_df = pd.read_csv(ohlc_path, parse_dates=["Date"]).set_index("Date").sort_index()
-    sentiment = label_sentiment(news_date, ohlc_df)
+    
+    # Get the dictionary of labels for all horizons
+    all_labels = get_labels_for_horizons(news_date, ohlc_df)
 
-    if sentiment is None:
+    if all_labels is None:
         continue
 
-    final_data.append({
+    # Prepare the dictionary for the final DataFrame row
+    data_row = {
         "Company": company,
         "Date": news_date,
         "News": news_text,
-        "Label": sentiment
-    })
-
-missing_ohlc = 0
-missing_date = 0
-bad_data = 0
-
-for idx, row in news_df.iterrows():
-    company = row["Symbol"].strip()
-    news_date = pd.to_datetime(row["Date"])
-    news_text = row["News"]
-
-    ohlc_path = os.path.join(OHLC_FOLDER, f"{company}_data.csv")
-    if not os.path.exists(ohlc_path):
-        missing_ohlc += 1
-        continue
-
-    ohlc_df = pd.read_csv(ohlc_path, parse_dates=["Date"]).set_index("Date").sort_index()
-    valid_date = get_valid_trading_date(news_date, ohlc_df)
-    if valid_date is None:
-        missing_date += 1
-        continue
-
-    try:
-        day_open = ohlc_df.loc[valid_date]["Open"]
-        day_close = ohlc_df.loc[valid_date]["Close"]
-    except Exception:
-        bad_data += 1
-        continue
-
-print(f"Missing OHLC files: {missing_ohlc}")
-print(f"No valid trading date: {missing_date}")
-print(f"Data errors: {bad_data}")
+    }
+    # Add all the labels (Label_T1, Label_T2, etc.) to the row
+    data_row.update(all_labels)
+    final_data.append(data_row)
 
 # Create DataFrame and save
 labeled_df = pd.DataFrame(final_data)
