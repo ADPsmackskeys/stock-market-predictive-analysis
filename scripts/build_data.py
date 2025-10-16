@@ -2,7 +2,7 @@ import pandas as pd
 import os
 
 # ----------------- CONFIG -----------------
-NEWS_FILE = "data/news_sentiment/stocks_news_new.csv"      # News CSV with 'Symbol', 'Date', 'News'
+NEWS_FILE = "data/news_sentiment/stocks_news_new.csv"  # News CSV with 'Symbol', 'Date', 'News'
 OHLC_FOLDER = "data/technical"                         # Folder containing OHLC CSVs for each stock
 OUTPUT_FILE = "data/news_sentiment/labeled_news.csv"   # Output labeled CSV
 NEUTRAL_THRESHOLD = 0.002                              # ±0.2% threshold for neutral
@@ -64,6 +64,37 @@ for idx, row in news_df.iterrows():
         "News": news_text,
         "Label": sentiment
     })
+
+missing_ohlc = 0
+missing_date = 0
+bad_data = 0
+
+for idx, row in news_df.iterrows():
+    company = row["Symbol"].strip()
+    news_date = pd.to_datetime(row["Date"])
+    news_text = row["News"]
+
+    ohlc_path = os.path.join(OHLC_FOLDER, f"{company}_data.csv")
+    if not os.path.exists(ohlc_path):
+        missing_ohlc += 1
+        continue
+
+    ohlc_df = pd.read_csv(ohlc_path, parse_dates=["Date"]).set_index("Date").sort_index()
+    valid_date = get_valid_trading_date(news_date, ohlc_df)
+    if valid_date is None:
+        missing_date += 1
+        continue
+
+    try:
+        day_open = ohlc_df.loc[valid_date]["Open"]
+        day_close = ohlc_df.loc[valid_date]["Close"]
+    except Exception:
+        bad_data += 1
+        continue
+
+print(f"Missing OHLC files: {missing_ohlc}")
+print(f"No valid trading date: {missing_date}")
+print(f"Data errors: {bad_data}")
 
 # Create DataFrame and save
 labeled_df = pd.DataFrame(final_data)
