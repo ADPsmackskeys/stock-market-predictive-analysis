@@ -11,60 +11,61 @@ NEUTRAL_THRESHOLD = 0.002                              # ±0.2% threshold for ne
 # Load news dataset
 news_df = pd.read_csv(NEWS_FILE, parse_dates=["Date"])
 
-# Helper: find same-day or next available trading date in OHLC data
+# ----------------- HELPERS -----------------
 def get_valid_trading_date(news_date, ohlc_df):
+    """Return same-day or next valid trading date."""
     if news_date in ohlc_df.index:
         return news_date
     future_dates = ohlc_df.index[ohlc_df.index > news_date]
     return future_dates[0] if len(future_dates) > 0 else None
 
-# Helper: create a single label from a percentage change
-def create_label(pct_change):
-    if abs(pct_change) <= NEUTRAL_THRESHOLD:
-        return "Neutral"
-    elif pct_change > 0:
-        return "Positive"
-    else:
-        return "Negative"
 
-# --- NEW FUNCTION ---
-# Get labels for multiple time horizons (T+1, T+2, T+5 trading sessions)
-def get_labels_for_horizons(news_date, ohlc_df):
-    start_date = get_valid_trading_date(news_date, ohlc_df)
-    if start_date is None:
-        return None
+def label_sentiment(news_date, ohlc_df):
+    """Label based on intraday open → close move."""
+    valid_date = get_valid_trading_date(news_date, ohlc_df)
+    if valid_date is None:
+        return None, None, None
 
     try:
-        # Find the integer index location of our starting date
-        start_loc = ohlc_df.index.get_loc(start_date)
-        start_open = ohlc_df.iloc[start_loc]["Open"]
-    except KeyError:
-        return None # Should not happen due to get_valid_trading_date, but good practice
+        day_open = ohlc_df.loc[valid_date, "Open"]
+        day_close = ohlc_df.loc[valid_date, "Close"]
+    except Exception:
+        return None, None, None
 
-    labels = {}
+    # Calculate same-day % change
+    pct_change_intraday = (day_close - day_open) / day_open
 
-    # Define horizons in terms of trading sessions from the start date
-    # T+1: Open of start_date -> Close of start_date (index offset 0)
-    # T+2: Open of start_date -> Close of next day (index offset 1)
-    # T+3: Open of start_date -> Close of day after that (index offset 2)
-    horizons = {"T1": 0, "T2": 1, "T3": 2}
+    # Label same-day sentiment
+    if abs(pct_change_intraday) <= NEUTRAL_THRESHOLD:
+        intraday_label = "Neutral"
+    elif pct_change_intraday > 0:
+        intraday_label = "Positive"
+    else:
+        intraday_label = "Negative"
 
-    for name, offset in horizons.items():
-        try:
-            # Find the closing price for the target future date
-            future_close = ohlc_df.iloc[start_loc + offset]["Close"]
-            pct_change = (future_close - start_open) / start_open
-            labels[f"Label_{name}"] = create_label(pct_change)
-        except IndexError:
-            # This happens if the news is too close to the end of the OHLC data
-            labels[f"Label_{name}"] = None
+    # ----- NEW: Compare previous close vs current close -----
+    prev_dates = ohlc_df.index[ohlc_df.index < valid_date]
+    if len(prev_dates) == 0:
+        return intraday_label, None, None  # No previous day to compare
 
-    return labels
+    prev_date = prev_dates[-1]
+    prev_close = ohlc_df.loc[prev_date, "Close"]
+    pct_change_prevclose = (day_close - prev_close) / prev_close
 
-# Process all news
+    # Label based on previous close comparison
+    if abs(pct_change_prevclose) <= NEUTRAL_THRESHOLD:
+        prevclose_label = "Neutral"
+    elif pct_change_prevclose > 0:
+        prevclose_label = "Positive"
+    else:
+        prevclose_label = "Negative"
+
+    return intraday_label, pct_change_intraday, prevclose_label
+
+
+# ----------------- MAIN PROCESS -----------------
 final_data = []
 
-# --- MODIFIED MAIN LOOP ---
 for idx, row in news_df.iterrows():
     company = row["Symbol"].strip()
     news_date = pd.to_datetime(row["Date"])
@@ -76,25 +77,23 @@ for idx, row in news_df.iterrows():
         continue
 
     ohlc_df = pd.read_csv(ohlc_path, parse_dates=["Date"]).set_index("Date").sort_index()
-    
-    # Get the dictionary of labels for all horizons
-    all_labels = get_labels_for_horizons(news_date, ohlc_df)
 
-    if all_labels is None:
+    intraday_label, pct_intraday, prevclose_label = label_sentiment(news_date, ohlc_df)
+    if intraday_label is None:
         continue
 
-    # Prepare the dictionary for the final DataFrame row
-    data_row = {
+    final_data.append({
         "Company": company,
         "Date": news_date,
         "News": news_text,
-    }
-    # Add all the labels (Label_T1, Label_T2, etc.) to the row
-    data_row.update(all_labels)
-    final_data.append(data_row)
+        "Intraday_Label": intraday_label,
+        "PrevClose_Label": prevclose_label,
+        "Intraday_Change(%)": round(pct_intraday * 100, 3) if pct_intraday is not None else None
+    })
 
-# Create DataFrame and save
+# Save labeled data
 labeled_df = pd.DataFrame(final_data)
 labeled_df.to_csv(OUTPUT_FILE, index=False)
 
-print(f"Done! Labeled dataset saved to {OUTPUT_FILE}, total rows: {len(labeled_df)}")
+print(f"Done! Labeled dataset saved to {OUTPUT_FILE}")
+print(f"Total rows labeled: {len(labeled_df)}")
