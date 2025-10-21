@@ -1,15 +1,28 @@
 import requests
-from searcher import searchlist
+# from searcher import searchlist
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
 import sys
 sys.path.insert(1, './config')
-from tickers import stocks # To those wondering about this. Go check config/tickers.py. 
+from tickers import stocks, keys# To those wondering about this. Go check config/tickers.py. 
 from htmldate import find_date # Noted. Thanks for doing it. Fixed it a bit (We can't treat folders as modules. And there was no space after the # <3)
 
 def normalize (name):
     return re.sub(r'[^A-Za-z0-9 ]+', '', name).strip ().lower ()
+
+def find_matching_value(data_dict, word):
+    for key, value in data_dict.items():
+        if word.lower() in key.lower():
+            return (key, value)
+
+with open('./scrapelist.txt', 'r') as f:
+    # This loops through each line in the file
+    # .strip() removes leading/trailing whitespace, including '\n'
+    searchlist = [line.strip() for line in f]
+
+# print(my_lines_stripped)
+# Output: ['Line 1', 'Line 2', 'Line 3']
 
 cnt = 0
 data = []
@@ -34,7 +47,7 @@ for k in searchlist:
 
     try:
         while ("Disclosure:" not in headlines[j].text):
-            if ("News18" in headlines[j].text or "Disclaimer:" in headlines[j].text or "Discover the latest Business News" in headlines[j].text or "Stocks Trade Ex-Dividend" in headlines[j].text or "Block" in headlines[j].text or "Bulk" in headlines[j].text):
+            if ("News18" in headlines[j].text or "Disclaimer:" in headlines[j].text or "Discover the latest Business News" in headlines[j].text):
                 break
 
             p_tag = headlines[j]
@@ -45,20 +58,22 @@ for k in searchlist:
             text = p_tag.get_text(separator="\n").strip()
 
             print(text, "\n")
-            sentences.append (headlines[j].text)
+            sentences.append (text)
             j += 1
 
+        cnt = 0
         for i in range(len(sentences) - 1):
             company_name = sentences[i].strip()
             news_text = sentences[i + 1].strip()
             newslist.append (news_text)
 
-        for key in stocks.keys():
-            if (company_name.lower ()) in (key.lower ()) and "Q1 (Consolidated" not in news_text[-1]:
+            if (company_name.lower ()) in (keys):
+                print (cnt)
+                cnt += 1 
                 data.append({
-                    "Company": key,
+                    "Company": find_matching_value (stocks, company_name)[0],
                     "News": news_text,
-                    "Symbol": stocks[key],
+                    "Symbol": find_matching_value (stocks, company_name)[1],
                     "Date": find_date (k)
                 })
             

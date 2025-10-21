@@ -50,7 +50,7 @@ def label_sentiment(news_date, ohlc_df):
 
     prev_date = prev_dates[-1]
     prev_close = ohlc_df.loc[prev_date, "Close"]
-    pct_change_prevclose = (day_close - prev_close) / prev_close
+    pct_change_prevclose = (day_open - prev_close) / prev_close
 
     # Label based on previous close comparison
     if abs(pct_change_prevclose) <= NEUTRAL_THRESHOLD:

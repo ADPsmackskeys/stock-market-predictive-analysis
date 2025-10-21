@@ -2139,3 +2139,5 @@ stocks = {
 
 
 TICKERS = list(stocks.values())
+keys = list (stocks.keys ())
+
