@@ -165,9 +165,16 @@ for idx, (company, symbol) in enumerate(stocks.items(), 1):
 # Save master CSV
 # ------------------------
 if all_signals:
+    # Combine all signals into a single DataFrame (optional, for Parquet)
     signals_df = pd.concat(all_signals, axis=0)
-    signals_df.to_csv(os.path.join(OUTPUT_FOLDER, "all_signals.csv.gz"), index=False, compression="gzip")
+    
+    # --- 1. Save per-ticker CSVs (compressed) ---
+    for symbol, df_stock in signals_df.groupby("Symbol"):
+        out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv.gz")
+        df_stock.to_csv(out_path, index=False, compression="gzip")
+
     print(f"Processed {len(signals_df)} signals from {len(stocks)} stocks.")
-    print(f"Saved master CSV and per-ticker performance CSVs in {OUTPUT_FOLDER}")
+    print(f"Saved per-ticker CSVs in {OUTPUT_FOLDER}")
+
 else:
     print("No signals detected.")
