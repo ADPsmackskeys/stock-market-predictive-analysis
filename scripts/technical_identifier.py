@@ -166,7 +166,7 @@ for idx, (company, symbol) in enumerate(stocks.items(), 1):
 # ------------------------
 if all_signals:
     signals_df = pd.concat(all_signals, axis=0)
-    signals_df.to_csv(os.path.join(OUTPUT_FOLDER, "all_signals.csv"), index=False)
+    signals_df.to_csv(os.path.join(OUTPUT_FOLDER, "all_signals.csv.gz"), index=False, compression="gzip")
     print(f"Processed {len(signals_df)} signals from {len(stocks)} stocks.")
     print(f"Saved master CSV and per-ticker performance CSVs in {OUTPUT_FOLDER}")
 else:
