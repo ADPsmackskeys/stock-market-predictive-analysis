@@ -5,7 +5,7 @@ import pandas as pd
 import re
 import sys
 sys.path.insert(1, './config')
-from tickers import stocks, keys# To those wondering about this. Go check config/tickers.py. 
+from tickers import stocks, keys # To those wondering about this. Go check config/tickers.py. 
 from htmldate import find_date # Noted. Thanks for doing it. Fixed it a bit (We can't treat folders as modules. And there was no space after the # <3)
 
 def normalize (name):
