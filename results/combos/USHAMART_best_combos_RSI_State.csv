@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_ADVANCE_BLOCK,Bearish,Overbought,4,0.25,0.00010185216727762181,4,0.5,-0.015529798795927585,4,0.75,-0.01889044469475315,12,4,0.5,0.5,2.5463041819405452e-05,-0.007764899397963793,-0.014167833521064863,-0.02190726987720925,USHAMART,RSI_State,

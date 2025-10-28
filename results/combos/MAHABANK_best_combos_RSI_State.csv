@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,4,0.5,-0.011574965297698248,4,0.75,-0.017178950399425463,4,0.5,0.012976195123707235,12,4,0.25,0.75,-0.005787482648849124,-0.012884212799569097,0.006488097561853617,-0.012183597886564604,MAHABANK,RSI_State,

@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_HARAMI,Bearish,Overbought,4,0.75,-0.019850570155256042,4,0.75,-0.003463399590764249,4,0.75,0.002754113241701439,12,4,0.0,1.0,-0.014887927616442032,-0.0025975496930731867,0.0020655849312760793,-0.015419892378239139,DLINKINDIA,RSI_State,

@@ -1,0 +1,2 @@
+Pattern,SignalType,CMF_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_SHOOTING_STAR,Bearish,Negative,4,0.25,0.005776454854334673,4,0.25,0.007228647272277594,4,0.25,0.010568245287408629,12,4,0.0,1.0,0.0014441137135836682,0.0018071618180693985,0.002642061321852157,0.005893336853505224,ENRIN,CMF_State,

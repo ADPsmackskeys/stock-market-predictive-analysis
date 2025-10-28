@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,5,0.2,0.024180732667933767,5,0.2,0.04144918114345557,5,0.4,0.03576557052410456,15,5,0.2,0.8,0.004836146533586754,0.008289836228691115,0.014306228209641825,0.027432210971919696,IRFC,RSI_State,

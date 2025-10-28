@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,4,0.5,0.00990723921972192,4,0.0,0.034296543363504406,4,0.25,0.030738111339128515,12,4,0.5,0.5,0.00495361960986096,0.0,0.007684527834782129,0.012638147444643089,ADVENZYMES,RSI_State,

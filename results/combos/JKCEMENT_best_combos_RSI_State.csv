@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,5,0.6,7.056567777079526e-05,5,0.4,0.017214337714521168,5,0.6,0.013372408210479558,15,5,0.19999999999999996,0.8,4.233940666247715e-05,0.006885735085808468,0.008023444926287735,0.01495151941875868,JKCEMENT,RSI_State,

@@ -8,7 +8,7 @@ FILE_SUFFIX = "_data.csv"
 # Strong candlestick patterns with base scores
 candlestick_patterns = {
     # Bullish
-    "CDL_BULLISH_ENGULFING": (talib.CDLENGULFING, 9),
+    "CDL_ENGULFING": (talib.CDLENGULFING, 9),
     "CDL_PIERCING": (talib.CDLPIERCING, 8),
     "CDL_HARAMI": (talib.CDLHARAMI, 6),
     "CDL_MORNING_STAR": (talib.CDLMORNINGSTAR, 9),

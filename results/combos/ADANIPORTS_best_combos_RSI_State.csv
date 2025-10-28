@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_ADVANCE_BLOCK,Bearish,Overbought,4,0.25,0.009997369586345561,4,0.25,0.013442485348706568,4,0.5,0.008965043878593426,12,4,0.25,0.75,0.0024993423965863903,0.003360621337176642,0.004482521939296713,0.010342485673059745,ADANIPORTS,RSI_State,

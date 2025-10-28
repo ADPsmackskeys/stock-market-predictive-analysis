@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_INVERTED_HAMMER,Bullish,Oversold,4,0.5,0.016594448971953196,4,0.75,0.028630219810787255,4,0.75,0.03995823227174222,12,4,0.25,0.75,0.008297224485976598,0.02147266485809044,0.029968674203806667,0.059738563547873706,SURANASOL,RSI_State,

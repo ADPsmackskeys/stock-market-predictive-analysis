@@ -1,0 +1,2 @@
+Pattern,SignalType,MACD_Trend,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bullish,Bullish,4,1.0,0.03229108569809125,4,0.75,0.03571068172882108,4,0.75,0.051228005750132366,12,4,0.25,0.75,0.03229108569809125,0.02678301129661581,0.038421004312599275,0.09749510130730633,SRD,MACD_Trend,

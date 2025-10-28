@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,4,0.5,-0.002321461402046532,4,0.5,0.0020841166479792783,4,0.75,0.02885722024389009,12,4,0.25,0.75,-0.001160730701023266,0.0010420583239896392,0.02164291518291757,0.021524242805883942,TATAINVEST,RSI_State,

@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,5,0.6,-0.019604159613585238,5,1.0,-0.052580136908055984,5,0.8,-0.04919079380870952,15,5,0.4,0.6,-0.011762495768151143,-0.052580136908055984,-0.03935263504696762,-0.10369526772317475,HILTON,RSI_State,

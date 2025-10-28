@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_INVERTED_HAMMER,Bullish,Oversold,4,0.5,0.007009874927289356,4,0.5,-0.01607630701319654,4,0.25,-0.03424460205004906,12,4,0.25,0.75,0.003504937463644678,-0.00803815350659827,-0.008561150512512265,-0.013094366555465857,BESTAGRO,RSI_State,

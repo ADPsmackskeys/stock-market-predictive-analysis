@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,5,0.4,-0.00812242791962967,5,0.6,0.0033906901853990147,5,0.4,0.027802932558421433,15,5,0.19999999999999996,0.8,-0.0032489711678518685,0.0020344141112394088,0.011121173023368574,0.009906615966756115,INTENTECH,RSI_State,

@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_ADVANCE_BLOCK,Bearish,Overbought,4,0.25,0.0026345165638652634,4,0.5,0.007864163241357913,4,0.5,-0.01460672314114217,12,4,0.25,0.75,0.0006586291409663159,0.003932081620678957,-0.007303361570571085,-0.0027126508089258122,FLUOROCHEM,RSI_State,

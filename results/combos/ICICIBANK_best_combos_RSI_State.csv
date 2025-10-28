@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_HARAMI,Bearish,Overbought,5,0.2,0.01127952400886536,5,0.2,0.005866767105973491,5,0.2,0.012691691326692678,15,5,0.0,1.0,0.0022559048017730724,0.0011733534211946983,0.0025383382653385357,0.005967596488306306,ICICIBANK,RSI_State,

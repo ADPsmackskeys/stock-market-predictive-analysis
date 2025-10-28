@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_SHOOTING_STAR,Bearish,Overbought,4,0.25,0.04278078440359298,4,0.5,0.04372554034591086,4,0.5,0.04995086289317996,12,4,0.25,0.75,0.010695196100898245,0.02186277017295543,0.02497543144658998,0.057533397720443656,DENORA,RSI_State,

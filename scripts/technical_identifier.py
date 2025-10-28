@@ -170,8 +170,8 @@ if all_signals:
     
     # --- 1. Save per-ticker CSVs (compressed) ---
     for symbol, df_stock in signals_df.groupby("Symbol"):
-        out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv.gz")
-        df_stock.to_csv(out_path, index=False, compression="gzip")
+        out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
+        df_stock.to_csv(out_path, index=False)
 
     print(f"Processed {len(signals_df)} signals from {len(stocks)} stocks.")
     print(f"Saved per-ticker CSVs in {OUTPUT_FOLDER}")

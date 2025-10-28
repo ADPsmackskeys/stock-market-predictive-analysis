@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_BULLISH_ENGULFING,Bearish,Overbought,5,1.0,-0.03723194454749459,5,0.8,-0.03647731871734285,5,1.0,-0.05628943803612483,15,5,0.19999999999999996,0.8,-0.03723194454749459,-0.029181854973874283,-0.05628943803612483,-0.12270323755749371,TEJASNET,RSI_State,

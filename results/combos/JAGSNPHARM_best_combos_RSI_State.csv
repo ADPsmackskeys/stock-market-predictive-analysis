@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_SHOOTING_STAR,Bearish,Overbought,4,0.75,-0.02259024893212383,4,0.75,0.012611527764586156,4,0.75,-0.003628078348266811,12,4,0.0,1.0,-0.016942686699092872,0.009458645823439617,-0.0027210587612001083,-0.010205099636853364,JAGSNPHARM,RSI_State,

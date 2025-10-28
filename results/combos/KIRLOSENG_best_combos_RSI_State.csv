@@ -1,0 +1,2 @@
+Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_HARAMI,Bearish,Overbought,4,0.75,-0.009851696666405008,4,0.75,-0.009613967020350417,4,0.5,-0.00025848872059802686,12,4,0.25,0.75,-0.007388772499803756,-0.007210475265262813,-0.00012924436029901343,-0.014728492125365582,KIRLOSENG,RSI_State,

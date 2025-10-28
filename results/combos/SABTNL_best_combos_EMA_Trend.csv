@@ -1,0 +1,4 @@
+Pattern,SignalType,EMA_Trend,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
+CDL_INVERTED_HAMMER,Bullish,Bullish,4,0.25,-0.012498960199315678,4,0.25,-0.023863455466191258,4,0.25,-0.033388951440225245,12,4,0.0,1.0,-0.0031247400498289196,-0.0059658638665478145,-0.008347237860056311,-0.017437841776433045,SABTNL,EMA_Trend,
+CDL_HARAMI,Bullish,Bullish,13,0.0,0.0,13,0.0,0.0,13,0.0,-0.007798573975044559,39,13,0.0,1.0,0.0,0.0,-0.0,0.0,SABTNL,EMA_Trend,
+CDL_HARAMI_CROSS,Bullish,Bullish,13,0.0,0.0,13,0.0,0.0,13,0.0,-0.007798573975044559,39,13,0.0,1.0,0.0,0.0,-0.0,0.0,SABTNL,EMA_Trend,
