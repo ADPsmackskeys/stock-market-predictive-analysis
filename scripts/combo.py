@@ -16,7 +16,7 @@ from scipy.stats import fisher_exact
 from pathlib import Path
 
 # ---------------------------
-# CONFIG - tweak these
+# CONFIG
 # ---------------------------
 INPUT_DATA_FOLDER = "data/technical"   # folder containing SYMBOL_data.csv files
 DATA_SUFFIX = "_data.csv"
@@ -29,12 +29,12 @@ Path(COMBO_OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
 import talib
 CANDLE_CLASSIFIED = {
     # Bullish patterns (we will still check sign from TA-Lib: val>0 => bullish occurrence)
-    "CDL_BULLISH_ENGULFING": talib.CDLENGULFING,
+    "CDL_ENGULFING": talib.CDLENGULFING,
     "CDL_PIERCING": talib.CDLPIERCING,
     "CDL_HARAMI": talib.CDLHARAMI,
     "CDL_MORNING_STAR": talib.CDLMORNINGSTAR,
     "CDL_THREE_WHITE_SOLDIERS": talib.CDL3WHITESOLDIERS,
-    "CDL_THREE_INSIDE_UP": talib.CDL3INSIDE,       # TA-Lib function reused; naming kept per your mapping
+    "CDL_THREE_INSIDE_UP": talib.CDL3INSIDE,       
     "CDL_THREE_OUTSIDE_UP": talib.CDL3OUTSIDE,
     "CDL_HAMMER": talib.CDLHAMMER,
     "CDL_INVERTED_HAMMER": talib.CDLINVERTEDHAMMER,
@@ -157,7 +157,7 @@ def build_symbol_signals_and_performance(filepath, candlestick_map, indicator_co
         df[f"Move_{n}D"] = df["Close"].shift(-n) / df["Close"] - 1
         df[f"Direction_{n}D"] = df[f"Move_{n}D"].apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
 
-    # build signals list: candlestick detections and (optionally) indicator-only rows
+    # build signals list: candlestick detections and indicator-only rows
     pattern_cols = list(candlestick_map.keys())
     signals_list = []
 
@@ -170,7 +170,7 @@ def build_symbol_signals_and_performance(filepath, candlestick_map, indicator_co
             if pd.isna(val):
                 continue
             if val != 0:
-                # val>0 generally indicates bullish occurrence; val<0 bearish
+                # val > 0 generally indicates bullish occurrence; val<0 bearish
                 signal_type = "Bullish" if val > 0 else "Bearish"
                 signals_list.append({
                     "Date": date,
@@ -185,7 +185,7 @@ def build_symbol_signals_and_performance(filepath, candlestick_map, indicator_co
                     **{f"Direction_{h}D": row.get(f"Direction_{h}D", np.nan) for h in horizons},
                 })
 
-        # optionally also record indicator-only signals (kept for completeness)
+        # record indicator-only signals
         for ind in indicator_cols:
             val = row.get(ind, None)
             if pd.isna(val):
@@ -297,7 +297,7 @@ def analyze_combos_for_symbol(signals_df, symbol, indicators, horizons, candlest
                               top_k, compute_fisher):
     """
     For one symbol: for each indicator, keep only candlestick occurrences where the indicator
-    state aligns with the candlestick direction (bullish pattern + bullish indicator value, or bearish+bearish).
+    state aligns with the candlestick direction (bullish pattern + bullish indicator value, or bearish + bearish).
     Aggregate per (Pattern,SignalType,IndicatorState) across horizons, compute metrics and save per-indicator CSV.
     Also save a combined per-symbol combo CSV.
     """
