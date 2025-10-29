@@ -5,7 +5,7 @@ This Python script automates the extraction of all "Stocks to Watch" article URL
 
 ## Overview
 
-Moneycontrol publishes financial news articles, including "Stocks to Watch", in monthly sitemaps. This tool downloads those sitemaps and extracts URLs containing the keyword `"stocks-to-watch-today"` for further processing or analysis.
+Moneycontrol publishes financial news articles, including "Stocks to Watch", in monthly sitemaps. This tool downloads those sitemaps and extracts URLs containing the keyword `"stocks-to-watch-today"` for further processing or analysis which is used in this.
 
 ## Features
 
@@ -70,3 +70,4 @@ https://www.moneycontrol.com/news/business/markets/stocks-to-watch-today-august-
 ## License
 
 This project is released under the MIT License.
+
