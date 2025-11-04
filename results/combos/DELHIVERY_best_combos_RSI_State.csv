@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_HARAMI,Bullish,Oversold,5,0.8,-0.0034531951536556083,5,0.4,-0.016343877651474225,5,0.6,0.009538819214848004,15,5,0.4,0.6,-0.0027625561229244868,-0.00653755106058969,0.005723291528908802,-0.0035768156546053757,DELHIVERY,RSI_State,

@@ -1,2 +1,0 @@
-Pattern,SignalType,MACD_Trend,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_INVERTED_HAMMER,Bullish,Bullish,11,0.18181818181818182,-0.01275110036195961,11,0.09090909090909091,-0.029167132680190756,11,0.0,-0.043344908082097504,33,11,0.18181818181818182,0.8181818181818181,-0.0023183818839926564,-0.002651557516380978,-0.0,-0.004969939400373635,ODIGMA,MACD_Trend,

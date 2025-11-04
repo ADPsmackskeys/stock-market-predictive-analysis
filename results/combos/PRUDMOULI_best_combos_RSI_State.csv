@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_INVERTED_HAMMER,Bullish,Oversold,5,0.4,0.0048859202177490065,5,0.4,-0.002878468675121937,5,0.4,0.025011628405708853,15,5,0.0,1.0,0.001954368087099603,-0.0011513874700487749,0.010004651362283542,0.010807631979334369,PRUDMOULI,RSI_State,

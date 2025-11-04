@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_HARAMI,Bearish,Overbought,5,0.8,-0.011895179328089344,5,0.8,-0.013664751118724627,5,0.6,-0.010263979720014915,15,5,0.20000000000000007,0.7999999999999999,-0.009516143462471476,-0.010931800894979702,-0.006158387832008949,-0.026606332189460125,AMBIKCO,RSI_State,

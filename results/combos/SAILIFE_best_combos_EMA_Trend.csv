@@ -1,2 +1,0 @@
-Pattern,SignalType,EMA_Trend,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_HARAMI,Bullish,Bullish,5,0.6,0.0001495629295220624,5,0.6,-0.0027058497248982462,5,0.6,0.011508598044064677,15,5,0.0,1.0,8.973775771323743e-05,-0.0016235098349389476,0.006905158826438806,0.005371386749213096,SAILIFE,EMA_Trend,

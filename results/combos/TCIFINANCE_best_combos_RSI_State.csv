@@ -1,4 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_HARAMI,Bearish,Overbought,8,0.0,0.0,8,0.0,0.0,8,0.0,0.006198341000822061,24,8,0.0,1.0,0.0,0.0,0.0,0.0,TCIFINANCE,RSI_State,
-CDL_HARAMI_CROSS,Bearish,Overbought,8,0.0,0.0,8,0.0,0.0,8,0.0,0.006198341000822061,24,8,0.0,1.0,0.0,0.0,0.0,0.0,TCIFINANCE,RSI_State,
-CDL_INVERTED_HAMMER,Bullish,Oversold,5,0.0,-0.00833334492312492,5,0.2,-0.00615942354175667,5,0.0,-0.008423904374607605,15,5,0.2,0.8,-0.0,-0.0012318847083513341,-0.0,-0.0012318847083513341,TCIFINANCE,RSI_State,

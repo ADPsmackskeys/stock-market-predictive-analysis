@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_INVERTED_HAMMER,Bullish,Oversold,8,0.125,-0.029111984720479434,8,0.125,-0.052359130653256286,8,0.125,-0.07214943069946593,24,8,0.0,1.0,-0.003638998090059929,-0.006544891331657036,-0.009018678837433241,-0.019202568259150204,BIOFILCHEM,RSI_State,

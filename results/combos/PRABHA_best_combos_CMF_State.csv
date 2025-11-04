@@ -1,2 +1,0 @@
-Pattern,SignalType,CMF_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_BULLISH_ENGULFING,Bearish,Negative,8,0.75,-0.008714694651988916,8,0.75,-0.004251366813782256,8,0.75,-0.006477307994732631,24,8,0.0,1.0,-0.006536020988991687,-0.0031885251103366923,-0.004857980996049473,-0.014582527095377853,PRABHA,CMF_State,

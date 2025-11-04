@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_SHOOTING_STAR,Bearish,Overbought,4,1.0,-0.03257577589997371,4,0.5,-0.00649627156116081,4,0.5,-0.003732555330607401,12,4,0.5,0.5,-0.03257577589997371,-0.003248135780580405,-0.0018662776653037005,-0.037690189345857814,MANGCHEFER,RSI_State,

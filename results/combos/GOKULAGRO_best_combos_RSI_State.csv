@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_BULLISH_ENGULFING,Bearish,Overbought,7,0.42857142857142855,0.007586785998165186,7,0.42857142857142855,0.02979352649835581,7,0.42857142857142855,0.02949871138275189,21,7,0.0,1.0,0.0032514797134993653,0.01276865421358106,0.012642304878322238,0.028662438805402663,GOKULAGRO,RSI_State,

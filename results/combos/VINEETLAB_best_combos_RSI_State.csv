@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_HARAMI,Bullish,Oversold,4,0.5,0.02942834799226554,4,0.75,0.04838695621975328,4,1.0,0.08038935138682557,12,4,0.5,0.5,0.01471417399613277,0.03629021716481496,0.08038935138682557,0.1313937425477733,VINEETLAB,RSI_State,

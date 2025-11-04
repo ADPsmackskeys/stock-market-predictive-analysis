@@ -1,2 +1,0 @@
-Pattern,SignalType,EMA_Trend,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_BULLISH_ENGULFING,Bearish,Bearish,4,0.0,0.029324839224516397,4,0.5,0.0028687031047663625,4,0.25,0.025408959319592916,12,4,0.5,0.5,0.0,0.0014343515523831812,0.006352239829898229,0.00778659138228141,PROSTARM,EMA_Trend,

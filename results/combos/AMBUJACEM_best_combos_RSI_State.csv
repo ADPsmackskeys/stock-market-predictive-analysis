@@ -1,2 +1,0 @@
-Pattern,SignalType,RSI_State,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_BULLISH_ENGULFING,Bullish,Oversold,4,0.75,0.0007697169701057771,4,0.5,-0.009090166892539941,4,0.75,0.0032576366217240416,12,4,0.25,0.75,0.0005772877275793328,-0.004545083446269971,0.002443227466293031,-0.0015245682523976067,AMBUJACEM,RSI_State,

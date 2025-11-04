@@ -1,2 +1,0 @@
-Pattern,SignalType,MACD_Trend,Count_1D,SuccessRate_1D,AvgReturn_1D,Count_2D,SuccessRate_2D,AvgReturn_2D,Count_3D,SuccessRate_3D,AvgReturn_3D,Count_sum,Count_min,SuccessRange,ConsistencyScore,ExpectedReturn_1D,ExpectedReturn_2D,ExpectedReturn_3D,ExpectedReturn_sum,Symbol,Indicator,Company
-CDL_HARAMI,Bullish,Bullish,6,0.3333333333333333,-0.005000597470410854,6,0.3333333333333333,-0.010702405884384073,6,0.3333333333333333,-0.013112508979394236,18,6,0.0,1.0,-0.0016668658234702846,-0.0035674686281280243,-0.004370836326464745,-0.009605170778063055,CPCAP,MACD_Trend,
