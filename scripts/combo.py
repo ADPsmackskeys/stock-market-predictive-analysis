@@ -18,6 +18,7 @@ from pathlib import Path
 # ---------------------------
 # CONFIG
 # ---------------------------
+
 INPUT_DATA_FOLDER = "data/technical"   # folder containing SYMBOL_data.csv files
 DATA_SUFFIX = "_data.csv"
 OUTPUT_FOLDER = "results"              # where *_signals.csv and performance_*.csv go

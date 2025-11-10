@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import re
 import sys
+import os
 sys.path.insert(1, './config')
 from tickers import stocks, keys # To those wondering about this. Go check config/tickers.py. 
 from htmldate import find_date # Noted. Thanks for doing it. Fixed it a bit (We can't treat folders as modules. And there was no space after the # <3)
@@ -57,18 +58,21 @@ for k in searchlist:
 
             text = p_tag.get_text(separator="\n").strip()
 
-            print(text, "\n")
+            
             sentences.append (text)
             j += 1
 
-        cnt = 0
+        lower_to_original = {k.lower(): k for k in stocks.keys()}
+        keys = list(lower_to_original.keys())   # lowercase keys list
+
         for i in range(len(sentences) - 1):
             company_name = sentences[i].strip()
             news_text = sentences[i + 1].strip()
             newslist.append (news_text)
+            
 
-            if (company_name.lower ()) in (keys):
-                print (cnt)
+            if any(company_name.lower() in k for k in keys):
+                print(company_name.lower ())
                 cnt += 1 
                 data.append({
                     "Company": find_matching_value (stocks, company_name)[0],
@@ -76,11 +80,25 @@ for k in searchlist:
                     "Symbol": find_matching_value (stocks, company_name)[1],
                     "Date": find_date (k)
                 })
+                df = pd.DataFrame(data)
+                # df.to_csv("data/news_sentiment/stocks_news.csv", index = False, encoding = "utf-8-sig")
+                write_header = not os.path.exists("data/news_sentiment/stocks_news.csv")
+                
+                df.to_csv("data/news_sentiment/stocks_news.csv",
+                        mode="a",
+                        header=write_header,
+                        index=False,
+                        encoding="utf-8-sig")
+                file_path = "data/news_sentiment/stocks_news.csv"
+
+                df = pd.read_csv(file_path)
+                df = df.drop_duplicates()
+
+                df.to_csv(file_path, index=False, encoding="utf-8-sig")
             
     except IndexError:
         continue
 
 
-df = pd.DataFrame(data)
-df.to_csv("data/news_sentiment/stocks_news.csv", index = False, encoding = "utf-8-sig")
+
 print("Saved to stocks_news.csv")

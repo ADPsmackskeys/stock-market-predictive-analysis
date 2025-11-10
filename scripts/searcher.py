@@ -10,16 +10,16 @@ all_urls = []
 
 for year in range(2021, 2026):
     for month in range(1, 13):
-        if year == 2025 and month > 9:
+        if year == 2025 and month > 12:
             break
 
         sitemap_url = base_sitemap.format(year, str(month).zfill(2))
-        # print(f"Processing {sitemap_url} ...")
+        print(f"Processing {sitemap_url} ...")
 
         try:
             response = requests.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
             if response.status_code != 200:
-                # print(f"Failed to fetch {sitemap_url}, status: {response.status_code}")
+                print(f"Failed to fetch {sitemap_url}, status: {response.status_code}")
                 continue
 
             soup = BeautifulSoup(response.content, "xml")  # parse as XML
