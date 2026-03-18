@@ -8,9 +8,9 @@ base_sitemap = "https://www.moneycontrol.com/news/sitemap/sitemap-post-{}-{}.xml
 keyword = "stocks-to-watch-today"
 all_urls = []
 
-for year in range(2021, 2026):
+for year in range(2021, 2027):
     for month in range(1, 13):
-        if year == 2025 and month > 12:
+        if year == 2026 and month > 3:
             break
 
         sitemap_url = base_sitemap.format(year, str(month).zfill(2))

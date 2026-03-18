@@ -1,8 +1,11 @@
 import os
+import sys
 import pandas as pd
 import yfinance as yf
 import talib as ta
 from datetime import datetime
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from config.tickers import TICKERS  
 
 DATA_DIR = "data/technical"
@@ -25,6 +28,7 @@ def add_indicators(df):
     df["SMA_50"] = ta.SMA(close, timeperiod=50)
     df["EMA_20"] = ta.EMA(close, timeperiod=20)
     df["EMA_50"] = ta.EMA(close, timeperiod=50)
+    df["EMA_200"] = ta.EMA(close, timeperiod=200)
 
     # RSI
     df["RSI_14"] = ta.RSI(close, timeperiod=14)
