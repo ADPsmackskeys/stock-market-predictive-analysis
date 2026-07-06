@@ -3,7 +3,7 @@ import sys
 import pandas as pd
 import yfinance as yf
 import talib as ta
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from config.tickers import TICKERS  
@@ -16,6 +16,9 @@ failed_tickers = []
 # Start and end dates
 START_DATE = "2021-01-01"
 END_DATE = datetime.today().strftime("%Y-%m-%d")
+# yf.download's `end` is exclusive, so requesting end=END_DATE would never
+# actually fetch today's session -- push the request window one day further.
+FETCH_END = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
 
 def add_indicators(df):
     close = df["Close"].astype(float).values
@@ -90,51 +93,79 @@ def add_fundamentals(ticker, df):
         print(f"Failed to fetch fundamentals for {ticker}: {e}")
         return df
 
-for ticker in TICKERS:
+RAW_COLS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
+
+
+def update_ticker(ticker):
+    """Fetch and merge only the missing days for one ticker, then recompute
+    indicators over the full price history. Returns a short status string."""
     file_path = os.path.join(DATA_DIR, f"{ticker}_data.csv")
-    print(f"Processing {ticker}")
 
-    try:
-        yf_ticker = f"{ticker}.NS" if not ticker.endswith((".NS", ".BO")) else ticker
-        new_df = yf.download(
-            yf_ticker,
-            start=START_DATE,
-            end=END_DATE,
-            interval="1d",
-            auto_adjust=False,
-            progress=False
+    old_df = None
+    fetch_start = START_DATE
+    if os.path.exists(file_path):
+        old_df = pd.read_csv(file_path, parse_dates=["Date"])
+        if not old_df.empty:
+            last_date = old_df["Date"].max()
+            fetch_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if fetch_start > END_DATE:
+        return "already up to date"
+
+    print(f"Processing {ticker} from {fetch_start}")
+    yf_ticker = f"{ticker}.NS" if not ticker.endswith((".NS", ".BO")) else ticker
+    new_df = yf.download(
+        yf_ticker,
+        start=fetch_start,
+        end=FETCH_END,
+        interval="1d",
+        auto_adjust=False,
+        progress=False
+    )
+
+    if new_df.empty:
+        return "no new data"
+
+    if isinstance(new_df.columns, pd.MultiIndex):
+        new_df.columns = [c[0] for c in new_df.columns]
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
+
+    new_df = new_df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    if new_df.empty:
+        return "no valid new rows"
+
+    new_df.reset_index(inplace=True)
+    new_df = new_df[RAW_COLS]
+
+    # Merge with the existing raw price history (not the old indicator columns)
+    # before recomputing indicators, since things like EMA_200 need months of
+    # trailing lookback that the freshly-downloaded rows alone don't have.
+    if old_df is not None and not old_df.empty:
+        old_raw = old_df[RAW_COLS]
+        combined_raw = (
+            pd.concat([old_raw, new_df], ignore_index=True)
+            .drop_duplicates(subset=["Date"])
+            .sort_values("Date")
+            .reset_index(drop=True)
         )
+    else:
+        combined_raw = new_df.sort_values("Date").reset_index(drop=True)
 
-        if new_df.empty:
-            print(f"No data for {ticker}")
+    combined = add_indicators(combined_raw)
+    combined = add_fundamentals(yf_ticker, combined)
+    combined.to_csv(file_path, index=False)
+    return f"{len(new_df)} new rows, {len(combined)} total"
+
+
+if __name__ == "__main__":
+    for ticker in TICKERS:
+        try:
+            status = update_ticker(ticker)
+            print(f"  {ticker}: {status}")
+        except Exception as e:
+            print(f"Error for {ticker}: {e}")
             failed_tickers.append(ticker)
-            continue
 
-        if isinstance(new_df.columns, pd.MultiIndex):
-            new_df.columns = [c[0] for c in new_df.columns]
-
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
-
-        new_df = new_df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-        if new_df.empty:
-            print(f"No valid rows for {ticker}")
-            failed_tickers.append(ticker)
-            continue
-
-        new_df.reset_index(inplace=True)
-        new_df = add_indicators(new_df)
-        new_df = add_fundamentals(yf_ticker, new_df)
-
-        if os.path.exists(file_path):
-            old_df = pd.read_csv(file_path, parse_dates=["Date"])
-            combined = pd.concat([old_df, new_df]).drop_duplicates(subset=["Date"]).sort_values("Date")
-            combined.to_csv(file_path, index=False)
-        else:
-            new_df.to_csv(file_path, index=False)
-
-    except Exception as e:
-        print(f"Error for {ticker}: {e}")
-        failed_tickers.append(ticker)
-
-print("\nFailed Tickers:", failed_tickers)
+    print("\nFailed Tickers:", failed_tickers)

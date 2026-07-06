@@ -21,6 +21,7 @@ import glob
 import argparse
 import itertools
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -47,16 +48,23 @@ OUTPUT_FOLDER   = "results/signals_v2"
 Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
 
 # ── Horizon groups
-# Signals are assigned to one class. Each class has its own horizon list
-# and a minimum move threshold that must be breached for a "win".
+# Signals are assigned to one class. Each class has its own horizon list.
 # MFE is computed over the full window (not just close-at-N).
 HORIZON_GROUPS = {
-    "candle":   {"horizons": [2, 3, 5],    "min_move_pct": 0.5},
-    "mean_rev": {"horizons": [3, 5, 7],    "min_move_pct": 1.0},
-    "momentum": {"horizons": [5, 10, 15],  "min_move_pct": 1.5},
-    "trend":    {"horizons": [10, 20, 30], "min_move_pct": 2.5},
-    "volume":   {"horizons": [3, 7, 10],   "min_move_pct": 1.0},
+    "candle":   {"horizons": [2, 3, 5]},
+    "mean_rev": {"horizons": [3, 5, 7]},
+    "momentum": {"horizons": [5, 10, 15]},
+    "trend":    {"horizons": [10, 20, 30]},
+    "volume":   {"horizons": [3, 7, 10]},
 }
+
+# A "win" threshold that scales with each stock's *own* volatility (that day's
+# ATR as a % of price) and with the horizon length (sqrt(h), since a random
+# walk's expected drift grows with sqrt(time)). This replaces a flat per-class
+# min_move_pct, which was the same bar for a stock with a 2.5% ATR% and one
+# with a 10%+ ATR% -- systematically under-scoring low-vol names and inflating
+# scores for noisy ones. K is a single tunable constant instead of five.
+ATR_THRESHOLD_K = 0.15
 
 # Signal name → horizon class
 SIGNAL_HORIZON_CLASS = {
@@ -434,80 +442,128 @@ def get_horizon_class(signal_name: str) -> str:
 # SCORING — Profit Factor + Expected Value
 # ─────────────────────────────────────────────────────────────────────────────
 
-def score_signal(mask: pd.Series, direction: str, signal_name: str,
-                 df: pd.DataFrame) -> Optional[dict]:
+ALL_HORIZONS = sorted(set(h for g in HORIZON_GROUPS.values() for h in g["horizons"]))
+
+
+def precompute_horizon_arrays(df: pd.DataFrame) -> Dict[int, Dict[str, np.ndarray]]:
+    """Numpy arrays for every horizon, computed once per symbol instead of once
+    per (combo x horizon) evaluation -- this is the main cost driver at scale,
+    since the same MFE/close/threshold arrays were previously re-sliced out of
+    the DataFrame (with pandas .loc/dropna overhead) for every single combo."""
+    atr_pct = (df["ATR_14"] / df["Close"]).to_numpy()
+    arrays = {}
+    for h in ALL_HORIZONS:
+        arrays[h] = {
+            "mfe_bull":  df[f"MFE_Bull_{h}D"].to_numpy(),
+            "mfe_bear":  df[f"MFE_Bear_{h}D"].to_numpy(),
+            "fwd_close": df[f"Fwd_Close_{h}D"].to_numpy(),
+            "min_move":  ATR_THRESHOLD_K * atr_pct * np.sqrt(h),
+        }
+    return arrays
+
+
+def precompute_class_valid_masks(n: int) -> Dict[str, np.ndarray]:
+    """Per-class boolean mask excluding the tail rows with no forward window
+    (same restriction the old code applied via df.index[:-max_h])."""
+    masks = {}
+    for hclass, hgroup in HORIZON_GROUPS.items():
+        max_h = max(hgroup["horizons"])
+        valid = np.zeros(n, dtype=bool)
+        valid[: n - max_h if n > max_h else n] = True
+        masks[hclass] = valid
+    return masks
+
+
+def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
+                  horizon_arrays: Dict[int, Dict[str, np.ndarray]],
+                  class_valid_masks: Dict[str, np.ndarray]) -> Optional[dict]:
     """
-    Primary metrics:
-      WinRate_MFE  — % of occurrences where MFE exceeded min_move threshold
+    Primary metrics (per horizon):
+      WinRate_MFE  — % of occurrences where MFE exceeded the ATR-normalized threshold
       AvgWin       — average close-at-N return on winning occurrences
       AvgLoss      — average close-at-N return on losing occurrences
       EV           — Expected Value = win_rate × avg_win + loss_rate × avg_loss
       ProfitFactor — gross profit / gross loss
-      Consistency  — 1 - range of win rates across horizons
+      CompositeScore_{h}D — per-horizon quality score (EV × max(PF,1) × log1p(count))
 
-    CompositeScore = EV × max(PF, 1) × consistency × log1p(count)
+    Aggregate metrics (across all horizons in the signal's class):
+      Consistency    — 1 - range of win rates across horizons
+      CompositeScore — EV × max(PF,1) × consistency × log1p(count)
+      BestHorizon    — horizon with the highest CompositeScore_{h}D
+
+    CompositeScore (blended) is the robustness gate used for ranking/leaderboards
+    — it penalizes a signal that only "worked" at one cherry-picked horizon.
+    BestHorizon / CompositeScore_{h}D exist so a live scan can say *when* to
+    expect the move, once a signal has already cleared that gate.
     """
     hclass   = get_horizon_class(signal_name)
     hgroup   = HORIZON_GROUPS.get(hclass, HORIZON_GROUPS["momentum"])
     horizons = hgroup["horizons"]
-    min_move = hgroup["min_move_pct"] / 100.0
+    valid_class = class_valid_masks.get(hclass, class_valid_masks["momentum"])
 
-    max_h    = max(horizons)
-    valid_idx = df.index[:-max_h] if len(df) > max_h else df.index
-    mask      = mask.reindex(df.index, fill_value=False) & df.index.isin(valid_idx)
-    count     = int(mask.sum())
+    combined_mask = mask_arr & valid_class
+    count = int(combined_mask.sum())
 
     if count < MIN_OCCURRENCES:
         return None
 
-    result = {"Count": count, "HorizonClass": hclass, "Direction": direction,
-              "MinMovePct": hgroup["min_move_pct"]}
-    all_evs, all_srs, all_pfs = [], [], []
+    result = {"Count": count, "HorizonClass": hclass, "Direction": direction}
+    all_evs, all_srs, all_pfs, horizon_composites = [], [], [], []
+    mfe_key    = "mfe_bull" if direction == "Bullish" else "mfe_bear"
+    multiplier = 1.0 if direction == "Bullish" else -1.0
 
     for h in horizons:
-        mfe_col   = f"MFE_Bull_{h}D" if direction == "Bullish" else f"MFE_Bear_{h}D"
-        close_col = f"Fwd_Close_{h}D"
-
-        if mfe_col not in df.columns or close_col not in df.columns:
+        harr = horizon_arrays.get(h)
+        if harr is None:
             continue
 
-        mfe_vals   = df.loc[mask, mfe_col].dropna()
-        close_vals = df.loc[mask, close_col].dropna()
+        mfe_full      = harr[mfe_key]
+        close_full    = harr["fwd_close"]
+        min_move_full = harr["min_move"]
 
-        if len(mfe_vals) < MIN_OCCURRENCES:
+        valid_h = combined_mask & ~np.isnan(mfe_full) & ~np.isnan(close_full) & ~np.isnan(min_move_full)
+        if int(valid_h.sum()) < MIN_OCCURRENCES:
             continue
 
-        # Win = MFE exceeded the threshold for this signal class
-        win_mask  = mfe_vals >= min_move
+        mfe_vals      = mfe_full[valid_h]
+        close_vals    = close_full[valid_h]
+        min_move_vals = min_move_full[valid_h]
+
+        # Win = MFE exceeded this stock's own ATR- and horizon-scaled threshold
+        win_mask  = mfe_vals >= min_move_vals
         win_rate  = float(win_mask.mean())
         loss_rate = 1.0 - win_rate
 
         # Realised returns (close-at-N) — signed for direction
-        multiplier = 1 if direction == "Bullish" else -1
         rv = close_vals * multiplier
-
         wins   = rv[win_mask]
         losses = rv[~win_mask]
 
-        avg_win  = float(wins.mean())  if len(wins)   > 0 else 0.0
-        avg_loss = float(losses.mean()) if len(losses) > 0 else 0.0
+        avg_win  = float(wins.mean())  if wins.size   > 0 else 0.0
+        avg_loss = float(losses.mean()) if losses.size > 0 else 0.0
 
         ev = win_rate * avg_win + loss_rate * avg_loss
 
-        gross_profit = float(wins[wins > 0].sum()) if len(wins) > 0 else 0.0
-        gross_loss   = float(abs(losses[losses < 0].sum())) if len(losses) > 0 else 1e-9
+        neg_losses   = losses[losses < 0]
+        gross_profit = float(wins[wins > 0].sum()) if wins.size > 0 else 0.0
+        gross_loss   = float(np.abs(neg_losses).sum()) if neg_losses.size > 0 else 1e-9
         pf = gross_profit / gross_loss if gross_loss > 1e-9 else np.nan
 
-        result[f"WinRate_MFE_{h}D"]    = round(win_rate, 4)
-        result[f"AvgWin_{h}D"]         = round(avg_win, 5)
-        result[f"AvgLoss_{h}D"]        = round(avg_loss, 5)
-        result[f"EV_{h}D"]             = round(ev, 6)
-        result[f"ProfitFactor_{h}D"]   = round(pf, 3) if not np.isnan(pf) else np.nan
-        result[f"AvgReturn_Close_{h}D"]= round(float(close_vals.mean()), 5)
+        composite_h = round(ev * max(pf if not np.isnan(pf) else 0.0, 1.0) * np.log1p(count), 6)
+
+        result[f"WinRate_MFE_{h}D"]     = round(win_rate, 4)
+        result[f"AvgWin_{h}D"]          = round(avg_win, 5)
+        result[f"AvgLoss_{h}D"]         = round(avg_loss, 5)
+        result[f"EV_{h}D"]              = round(ev, 6)
+        result[f"ProfitFactor_{h}D"]    = round(pf, 3) if not np.isnan(pf) else np.nan
+        result[f"AvgReturn_Close_{h}D"] = round(float(close_vals.mean()), 5)
+        result[f"AvgMinMovePct_{h}D"]   = round(float(min_move_vals.mean()) * 100, 3)
+        result[f"CompositeScore_{h}D"]  = composite_h
 
         all_evs.append(ev)
         all_srs.append(win_rate)
         all_pfs.append(pf if not np.isnan(pf) else 0.0)
+        horizon_composites.append((h, composite_h))
 
     if not all_evs:
         return None
@@ -519,31 +575,40 @@ def score_signal(mask: pd.Series, direction: str, signal_name: str,
     consistency = max(1.0 - sr_range, 0.0)
 
     composite = round(avg_ev * max(avg_pf, 1.0) * consistency * np.log1p(count), 6)
+    best_h, best_h_composite = max(horizon_composites, key=lambda t: t[1])
 
     result.update({
-        "AvgEV":           round(avg_ev, 6),
-        "AvgWinRate":      round(avg_sr, 4),
-        "AvgProfitFactor": round(avg_pf, 3),
-        "Consistency":     round(consistency, 4),
-        "CompositeScore":  composite,
+        "AvgEV":                round(avg_ev, 6),
+        "AvgWinRate":           round(avg_sr, 4),
+        "AvgProfitFactor":      round(avg_pf, 3),
+        "Consistency":          round(consistency, 4),
+        "CompositeScore":       composite,
+        "BestHorizon":          best_h,
+        "BestHorizonComposite": best_h_composite,
     })
     return result
 
 
-def fisher_p_value(mask, direction, df, horizon, min_move):
-    mfe_col = f"MFE_Bull_{horizon}D" if direction == "Bullish" else f"MFE_Bear_{horizon}D"
-    if mfe_col not in df.columns:
+def fisher_p_value(mask_arr: np.ndarray, direction: str,
+                    horizon_arrays: Dict[int, Dict[str, np.ndarray]],
+                    horizon: int, valid_class: np.ndarray) -> float:
+    harr = horizon_arrays.get(horizon)
+    if harr is None:
         return np.nan
-    max_h = max(max(g["horizons"]) for g in HORIZON_GROUPS.values())
-    valid = df.index[:-max_h] if len(df) > max_h else df.index
+    mfe_key       = "mfe_bull" if direction == "Bullish" else "mfe_bear"
+    mfe_full      = harr[mfe_key]
+    min_move_full = harr["min_move"]
 
-    all_mfe = df.loc[df.index.isin(valid), mfe_col].dropna()
-    sig_mfe = df.loc[mask & df.index.isin(valid), mfe_col].dropna()
+    valid     = valid_class & ~np.isnan(mfe_full) & ~np.isnan(min_move_full)
+    sig_valid = valid & mask_arr
 
-    a = int((sig_mfe >= min_move).sum())
-    b = int((sig_mfe < min_move).sum())
-    c = max(int((all_mfe >= min_move).sum()) - a, 0)
-    d = max(int((all_mfe < min_move).sum()) - b, 0)
+    all_mfe, all_min_move = mfe_full[valid], min_move_full[valid]
+    sig_mfe, sig_min_move = mfe_full[sig_valid], min_move_full[sig_valid]
+
+    a = int((sig_mfe >= sig_min_move).sum())
+    b = int((sig_mfe < sig_min_move).sum())
+    c = max(int((all_mfe >= all_min_move).sum()) - a, 0)
+    d = max(int((all_mfe < all_min_move).sum()) - b, 0)
 
     table = np.array([[a, b], [c, d]])
     if table.sum() == 0 or a + b == 0:
@@ -558,13 +623,14 @@ def fisher_p_value(mask, direction, df, horizon, min_move):
 # COMBO BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_combo_mask(signal_names, signal_map, df):
-    combined = pd.Series(True, index=df.index)
+def build_combo_mask(signal_names, signal_map_np: Dict[str, np.ndarray]) -> np.ndarray:
+    n = len(next(iter(signal_map_np.values())))
+    combined = np.ones(n, dtype=bool)
     for name in signal_names:
-        if name in signal_map:
-            combined = combined & signal_map[name]
+        if name in signal_map_np:
+            combined = combined & signal_map_np[name]
         else:
-            return pd.Series(False, index=df.index)
+            return np.zeros(n, dtype=bool)
     return combined
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -589,12 +655,19 @@ def run_symbol(filepath: str, test_triples: bool = False) -> Optional[pd.DataFra
     df = add_forward_windows(df)
     signal_map, direction_map = compute_all_signals(df)
 
+    # Convert once per symbol: every combo evaluation below reuses these numpy
+    # arrays directly instead of re-slicing the DataFrame (with pandas .loc /
+    # dropna overhead) on every single call -- this was the actual bottleneck.
+    signal_map_np     = {name: series.to_numpy() for name, series in signal_map.items()}
+    horizon_arrays     = precompute_horizon_arrays(df)
+    class_valid_masks  = precompute_class_valid_masks(len(df))
+
     bull_signals = [n for n, d in direction_map.items() if d == "Bullish"]
     bear_signals = [n for n, d in direction_map.items() if d == "Bearish"]
     rows = []
 
-    def evaluate(name: str, signal_names: list, mask: pd.Series, direction: str):
-        metrics = score_signal(mask, direction, name, df)
+    def evaluate(name: str, signal_names: list, mask_arr: np.ndarray, direction: str):
+        metrics = score_signal(mask_arr, direction, name, horizon_arrays, class_valid_masks)
         if metrics is None:
             return
         row = {
@@ -604,9 +677,10 @@ def run_symbol(filepath: str, test_triples: bool = False) -> Optional[pd.DataFra
         }
         row.update(metrics)
         if COMPUTE_FISHER:
-            hgroup   = HORIZON_GROUPS.get(get_horizon_class(name), HORIZON_GROUPS["momentum"])
-            min_move = hgroup["min_move_pct"] / 100.0
-            ps = [fisher_p_value(mask, direction, df, h, min_move) for h in hgroup["horizons"]]
+            hclass      = get_horizon_class(name)
+            hgroup      = HORIZON_GROUPS.get(hclass, HORIZON_GROUPS["momentum"])
+            valid_class = class_valid_masks.get(hclass, class_valid_masks["momentum"])
+            ps = [fisher_p_value(mask_arr, direction, horizon_arrays, h, valid_class) for h in hgroup["horizons"]]
             valid_ps = [p for p in ps if not np.isnan(p)]
             row["Fisher_p_min"]    = round(min(valid_ps), 5) if valid_ps else np.nan
             row["Fisher_sig_flag"] = int(bool(valid_ps) and min(valid_ps) < FISHER_ALPHA)
@@ -614,12 +688,12 @@ def run_symbol(filepath: str, test_triples: bool = False) -> Optional[pd.DataFra
 
     # Singles
     for name in list(ATOMIC_SIGNALS.keys()) + list(CANDLE_PATTERNS.keys()):
-        if name not in signal_map:
+        if name not in signal_map_np:
             continue
         direction = direction_map.get(name, "Both")
         if direction == "Both":
             continue
-        evaluate(name, [name], signal_map[name], direction)
+        evaluate(name, [name], signal_map_np[name], direction)
 
     # Predefined strategies
     for strat_name, spec in PREDEFINED_STRATEGIES.items():
@@ -628,28 +702,28 @@ def run_symbol(filepath: str, test_triples: bool = False) -> Optional[pd.DataFra
         if not TALIB_AVAILABLE and any(s.startswith("CDL_") for s in sig_names):
             continue
         try:
-            mask = build_combo_mask(sig_names, signal_map, df)
-            evaluate(f"STRAT_{strat_name}", sig_names, mask, direction)
+            mask_arr = build_combo_mask(sig_names, signal_map_np)
+            evaluate(f"STRAT_{strat_name}", sig_names, mask_arr, direction)
         except Exception:
             continue
 
     # Exhaustive pairs
     for direction, sig_list in [("Bullish", bull_signals), ("Bearish", bear_signals)]:
-        active = [n for n in sig_list if n in signal_map and signal_map[n].sum() >= MIN_OCCURRENCES // 2]
+        active = [n for n in sig_list if n in signal_map_np and signal_map_np[n].sum() >= MIN_OCCURRENCES // 2]
         for s1, s2 in itertools.combinations(active, 2):
-            mask = signal_map[s1] & signal_map[s2]
-            evaluate(f"{s1} + {s2}", [s1, s2], mask, direction)
+            mask_arr = signal_map_np[s1] & signal_map_np[s2]
+            evaluate(f"{s1} + {s2}", [s1, s2], mask_arr, direction)
 
     # Exhaustive triples
     if test_triples:
         for direction, sig_list in [("Bullish", bull_signals), ("Bearish", bear_signals)]:
             active = sorted(
-                [n for n in sig_list if n in signal_map and signal_map[n].sum() >= MIN_OCCURRENCES],
-                key=lambda n: -signal_map[n].sum()
+                [n for n in sig_list if n in signal_map_np and signal_map_np[n].sum() >= MIN_OCCURRENCES],
+                key=lambda n: -signal_map_np[n].sum()
             )[:25]
             for s1, s2, s3 in itertools.combinations(active, 3):
-                mask = signal_map[s1] & signal_map[s2] & signal_map[s3]
-                evaluate(f"{s1} + {s2} + {s3}", [s1, s2, s3], mask, direction)
+                mask_arr = signal_map_np[s1] & signal_map_np[s2] & signal_map_np[s3]
+                evaluate(f"{s1} + {s2} + {s3}", [s1, s2, s3], mask_arr, direction)
 
     if not rows:
         if VERBOSE: print(f"  [SKIP] No valid signals for {symbol}")
@@ -704,6 +778,7 @@ def main():
     parser.add_argument("--symbol",    type=str, default=None, help="Single symbol only")
     parser.add_argument("--triples",   action="store_true",    help="Test triple combos (slow)")
     parser.add_argument("--no-fisher", action="store_true",    help="Skip Fisher p-values")
+    parser.add_argument("--workers",   type=int, default=None, help="Parallel worker processes (default: CPU count)")
     args = parser.parse_args()
 
     global COMPUTE_FISHER
@@ -723,13 +798,25 @@ def main():
         print(f"No files found in {INPUT_FOLDER}")
         return
 
-    print(f"Processing {len(files)} symbols...\n")
+    n_workers = args.workers or os.cpu_count() or 1
+    print(f"Processing {len(files)} symbols across {n_workers} worker processes...\n")
+
     all_results = []
-    for i, fp in enumerate(files, 1):
-        print(f"[{i}/{len(files)}] {os.path.basename(fp)}")
-        result = run_symbol(fp, test_triples=args.triples)
-        if result is not None:
-            all_results.append(result)
+    done = 0
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(run_symbol, fp, args.triples): fp for fp in files}
+        for future in as_completed(futures):
+            fp = futures[future]
+            done += 1
+            try:
+                result = future.result()
+            except Exception as e:
+                print(f"[{done}/{len(files)}] [ERROR] {os.path.basename(fp)}: {e}")
+                continue
+            if result is not None:
+                all_results.append(result)
+            if done % 25 == 0 or done == len(files):
+                print(f"[{done}/{len(files)}] processed")
 
     print(f"\nBuilding leaderboard from {len(all_results)} symbols...")
     lb = build_leaderboard(all_results)
