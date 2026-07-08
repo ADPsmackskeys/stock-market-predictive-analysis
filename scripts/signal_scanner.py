@@ -404,9 +404,19 @@ def add_forward_windows(df: pd.DataFrame) -> pd.DataFrame:
     MFE is the most important metric: it tells you whether the signal gave you
     the opportunity to take profit at any point in the window, regardless of
     where price ended up at day N.
+
+    If the data has a "Segment" column (see fetch_technical_data.py's gap
+    handling), any forward window that would span two segments -- i.e. cross
+    a long real trading gap -- is nulled out. Segment ids are monotonically
+    non-decreasing, so a window starting at row i and ending at row i+h spans
+    a gap iff Segment[i] != Segment[i+h]; checking the endpoints is enough.
+    Without this, a stock that went dormant for months and then resumed
+    trading would still get a fake multi-hundred-percent "h-day return"
+    computed across the gap.
     """
     df = df.copy()
     all_horizons = sorted(set(h for g in HORIZON_GROUPS.values() for h in g["horizons"]))
+    has_segments = "Segment" in df.columns
 
     for h in all_horizons:
         df[f"Fwd_Close_{h}D"] = df["Close"].shift(-h) / df["Close"] - 1
@@ -420,6 +430,12 @@ def add_forward_windows(df: pd.DataFrame) -> pd.DataFrame:
         df[f"MFE_Bear_{h}D"] = (
             1 - df["Low"].rolling(h).min().shift(-h) / df["Close"]
         )
+
+        if has_segments:
+            same_segment = df["Segment"] == df["Segment"].shift(-h)
+            df[f"Fwd_Close_{h}D"] = df[f"Fwd_Close_{h}D"].where(same_segment)
+            df[f"MFE_Bull_{h}D"] = df[f"MFE_Bull_{h}D"].where(same_segment)
+            df[f"MFE_Bear_{h}D"] = df[f"MFE_Bear_{h}D"].where(same_segment)
     return df
 
 # ─────────────────────────────────────────────────────────────────────────────
