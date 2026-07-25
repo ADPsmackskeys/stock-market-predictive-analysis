@@ -9,11 +9,26 @@ Key changes from v1:
   - Success rate alone is deprecated as primary metric
   - Cross-symbol leaderboard unchanged
 
+Changes in this revision:
+  - Per-horizon MedianReturn_Close_{h}D alongside the existing
+    AvgReturn_Close_{h}D, so a mean/median gap is visible directly in the
+    output instead of requiring a separate pass over the raw data.
+  - Per-horizon Top1_Trade_Share_{h}D: the fraction of a signal's gross
+    profit contributed by its single largest winning trade. A signal whose
+    edge comes from one idiosyncratic outlier (a stock-specific mania,
+    a leftover data glitch, etc.) rather than a repeatable pattern shows up
+    here as a high share even when Count clears MIN_OCCURRENCES.
+  - Aggregate MaxTop1TradeShare / AvgMedianReturn and a Concentration_Flag,
+    used to keep outlier-driven signals from crowding out genuinely
+    repeatable ones at the top of the per-symbol and cross-symbol outputs.
+
 Usage:
     python signal_scanner.py
     python signal_scanner.py --symbol RELIANCE
     python signal_scanner.py --triples
     python signal_scanner.py --no-fisher
+    python signal_scanner.py --max-concentration 0.5
+    python signal_scanner.py --keep-concentrated
 """
 
 import os
@@ -65,6 +80,14 @@ HORIZON_GROUPS = {
 # with a 10%+ ATR% -- systematically under-scoring low-vol names and inflating
 # scores for noisy ones. K is a single tunable constant instead of five.
 ATR_THRESHOLD_K = 0.15
+
+# A signal whose single largest winning trade accounts for more than this
+# fraction of its total gross profit is flagged as outlier-concentrated: its
+# apparent edge may come from one idiosyncratic event (a stock-specific
+# mania, an earnings gap, a leftover data glitch) rather than a repeatable
+# pattern, even though Count clears MIN_OCCURRENCES. See Top1_Trade_Share_{h}D
+# / MaxTop1TradeShare / Concentration_Flag below.
+CONCENTRATION_THRESHOLD = 0.40
 
 # Signal name → horizon class
 SIGNAL_HORIZON_CLASS = {
@@ -130,6 +153,11 @@ STRATEGY_HORIZON_OVERRIDE = {
     "ShootingStar_EMA_Bear": "candle", "EveningStar_MACD_Bear": "candle",
 }
 
+# NOTE: as of the episode-based counting fix below, this threshold is applied
+# to the number of distinct *episodes* (contiguous True-runs) of a signal, not
+# the number of raw True-rows. A signal that used to clear 40 True-rows but
+# was really only 17 episodes now needs 10 genuinely separate occurrences, not
+# 10 days that could all belong to the same multi-week persistent state.
 MIN_OCCURRENCES = 10
 TOP_N_PER_DIR   = 25
 COMPUTE_FISHER  = True
@@ -490,6 +518,35 @@ def precompute_class_valid_masks(n: int) -> Dict[str, np.ndarray]:
     return masks
 
 
+def get_episode_start_mask(mask_arr: np.ndarray) -> np.ndarray:
+    """Collapse a boolean occurrence mask down to just the first day of each
+    contiguous True-run ("episode").
+
+    Why this exists: state-type signals (EMA_Bullish_State, Golden_Cross_State,
+    Price_Above_EMA200, MACD_Bullish_State, and any combo built from them) can
+    stay True for weeks or months at a stretch. Scoring every single day of
+    that stretch as its own "occurrence" does two bad things: (1) it inflates
+    Count/MIN_OCCURRENCES and the Fisher-test sample size with rows that are
+    not independent trials -- they're the same underlying episode counted
+    dozens of times (this is exactly the QPOWER 40-rows/17-episodes and
+    DIACABS 339-rows/90-episodes gap); and (2) their forward-return/MFE
+    windows overlap almost completely with their neighbors' windows, so the
+    win-rate/EV/ProfitFactor distributions built from them are dominated by
+    a handful of underlying price moves dressed up as many samples.
+
+    Event-type signals (Golden_Cross_Event, MACD_Cross_Up_Event, RSI_Cross50_Up,
+    etc.) are single-day triggers by construction, so every True day is
+    already its own episode and this is a no-op for them.
+    """
+    mask_arr = np.asarray(mask_arr, dtype=bool)
+    if mask_arr.size == 0:
+        return mask_arr
+    prev_true = np.empty_like(mask_arr)
+    prev_true[0] = False
+    prev_true[1:] = mask_arr[:-1]
+    return mask_arr & ~prev_true
+
+
 def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
                   horizon_arrays: Dict[int, Dict[str, np.ndarray]],
                   class_valid_masks: Dict[str, np.ndarray]) -> Optional[dict]:
@@ -500,24 +557,52 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
       AvgLoss      — average close-at-N return on losing occurrences
       EV           — Expected Value = win_rate × avg_win + loss_rate × avg_loss
       ProfitFactor — gross profit / gross loss
+      MedianReturn_Close_{h}D — median (not mean) close-at-N return across all
+                     occurrences. A large gap between this and
+                     AvgReturn_Close_{h}D is itself a signal that the mean is
+                     being pulled around by a handful of outlier trades rather
+                     than reflecting a typical occurrence.
+      Top1_Trade_Share_{h}D — fraction of this horizon's gross profit
+                     contributed by the single largest winning trade. High
+                     values (see CONCENTRATION_THRESHOLD) mean the apparent
+                     edge is riding on one idiosyncratic event, not a
+                     repeatable pattern, even when Count clears
+                     MIN_OCCURRENCES.
       CompositeScore_{h}D — per-horizon quality score (EV × max(PF,1) × log1p(count))
 
     Aggregate metrics (across all horizons in the signal's class):
       Consistency    — 1 - range of win rates across horizons
       CompositeScore — EV × max(PF,1) × consistency × log1p(count)
       BestHorizon    — horizon with the highest CompositeScore_{h}D
+      AvgMedianReturn      — mean, across horizons, of MedianReturn_Close_{h}D
+      MaxTop1TradeShare    — the largest Top1_Trade_Share_{h}D across horizons
+      Concentration_Flag   — 1 if MaxTop1TradeShare exceeds
+                              CONCENTRATION_THRESHOLD, else 0
 
     CompositeScore (blended) is the robustness gate used for ranking/leaderboards
     — it penalizes a signal that only "worked" at one cherry-picked horizon.
     BestHorizon / CompositeScore_{h}D exist so a live scan can say *when* to
     expect the move, once a signal has already cleared that gate.
+    Concentration_Flag is a separate gate: a signal can have a great
+    CompositeScore and still be flagged if that score is really one outlier
+    trade wearing a "reliable pattern" costume — see run_symbol()'s top-N
+    selection, which excludes flagged rows by default.
+
+    Episode-based counting: mask_arr is collapsed to episode-start days
+    (see get_episode_start_mask) before anything else happens. Count,
+    MIN_OCCURRENCES, WinRate/EV/ProfitFactor, and the Fisher-test "signal"
+    side are therefore all computed over distinct episodes, not raw True-rows
+    -- a persistent state signal no longer gets to multiply its sample size
+    (or its weight in CompositeScore's log1p(count) term) just by staying
+    true for a long time.
     """
     hclass   = get_horizon_class(signal_name)
     hgroup   = HORIZON_GROUPS.get(hclass, HORIZON_GROUPS["momentum"])
     horizons = hgroup["horizons"]
     valid_class = class_valid_masks.get(hclass, class_valid_masks["momentum"])
 
-    combined_mask = mask_arr & valid_class
+    episode_mask  = get_episode_start_mask(mask_arr)
+    combined_mask = episode_mask & valid_class
     count = int(combined_mask.sum())
 
     if count < MIN_OCCURRENCES:
@@ -525,6 +610,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
 
     result = {"Count": count, "HorizonClass": hclass, "Direction": direction}
     all_evs, all_srs, all_pfs, horizon_composites = [], [], [], []
+    all_medians, all_top1_shares = [], []
     mfe_key    = "mfe_bull" if direction == "Bullish" else "mfe_bear"
     multiplier = 1.0 if direction == "Bullish" else -1.0
 
@@ -561,24 +647,42 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         ev = win_rate * avg_win + loss_rate * avg_loss
 
         neg_losses   = losses[losses < 0]
-        gross_profit = float(wins[wins > 0].sum()) if wins.size > 0 else 0.0
+        pos_wins     = wins[wins > 0]
+        gross_profit = float(pos_wins.sum()) if pos_wins.size > 0 else 0.0
         gross_loss   = float(np.abs(neg_losses).sum()) if neg_losses.size > 0 else 1e-9
         pf = gross_profit / gross_loss if gross_loss > 1e-9 else np.nan
 
+        # Median close-at-N return, unsigned (matches AvgReturn_Close_{h}D's
+        # convention) -- compare the two directly to spot a mean pulled
+        # around by a handful of outlier occurrences.
+        median_return = float(np.median(close_vals))
+
+        # Share of this horizon's gross profit coming from its single
+        # largest winning trade. NaN when there's no gross profit to share
+        # (no winning trades) -- that's a "can't compute" case, not a "0%
+        # concentration" case, so it's kept out of the composite/aggregate
+        # rather than silently treated as safe.
+        top1_share = (float(pos_wins.max()) / gross_profit) if (gross_profit > 1e-9 and pos_wins.size > 0) else np.nan
+
         composite_h = round(ev * max(pf if not np.isnan(pf) else 0.0, 1.0) * np.log1p(count), 6)
 
-        result[f"WinRate_MFE_{h}D"]     = round(win_rate, 4)
-        result[f"AvgWin_{h}D"]          = round(avg_win, 5)
-        result[f"AvgLoss_{h}D"]         = round(avg_loss, 5)
-        result[f"EV_{h}D"]              = round(ev, 6)
-        result[f"ProfitFactor_{h}D"]    = round(pf, 3) if not np.isnan(pf) else np.nan
-        result[f"AvgReturn_Close_{h}D"] = round(float(close_vals.mean()), 5)
-        result[f"AvgMinMovePct_{h}D"]   = round(float(min_move_vals.mean()) * 100, 3)
-        result[f"CompositeScore_{h}D"]  = composite_h
+        result[f"WinRate_MFE_{h}D"]        = round(win_rate, 4)
+        result[f"AvgWin_{h}D"]             = round(avg_win, 5)
+        result[f"AvgLoss_{h}D"]            = round(avg_loss, 5)
+        result[f"EV_{h}D"]                 = round(ev, 6)
+        result[f"ProfitFactor_{h}D"]       = round(pf, 3) if not np.isnan(pf) else np.nan
+        result[f"AvgReturn_Close_{h}D"]    = round(float(close_vals.mean()), 5)
+        result[f"MedianReturn_Close_{h}D"] = round(median_return, 5)
+        result[f"AvgMinMovePct_{h}D"]      = round(float(min_move_vals.mean()) * 100, 3)
+        result[f"Top1_Trade_Share_{h}D"]   = round(top1_share, 4) if not np.isnan(top1_share) else np.nan
+        result[f"CompositeScore_{h}D"]     = composite_h
 
         all_evs.append(ev)
         all_srs.append(win_rate)
         all_pfs.append(pf if not np.isnan(pf) else 0.0)
+        all_medians.append(median_return)
+        if not np.isnan(top1_share):
+            all_top1_shares.append(top1_share)
         horizon_composites.append((h, composite_h))
 
     if not all_evs:
@@ -593,6 +697,10 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
     composite = round(avg_ev * max(avg_pf, 1.0) * consistency * np.log1p(count), 6)
     best_h, best_h_composite = max(horizon_composites, key=lambda t: t[1])
 
+    avg_median      = float(np.mean(all_medians)) if all_medians else np.nan
+    max_top1_share  = float(max(all_top1_shares)) if all_top1_shares else np.nan
+    concentration_flag = int(not np.isnan(max_top1_share) and max_top1_share > CONCENTRATION_THRESHOLD)
+
     result.update({
         "AvgEV":                round(avg_ev, 6),
         "AvgWinRate":           round(avg_sr, 4),
@@ -601,6 +709,9 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         "CompositeScore":       composite,
         "BestHorizon":          best_h,
         "BestHorizonComposite": best_h_composite,
+        "AvgMedianReturn":      round(avg_median, 5) if not np.isnan(avg_median) else np.nan,
+        "MaxTop1TradeShare":    round(max_top1_share, 4) if not np.isnan(max_top1_share) else np.nan,
+        "Concentration_Flag":   concentration_flag,
     })
     return result
 
@@ -608,6 +719,18 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
 def fisher_p_value(mask_arr: np.ndarray, direction: str,
                     horizon_arrays: Dict[int, Dict[str, np.ndarray]],
                     horizon: int, valid_class: np.ndarray) -> float:
+    """
+    Fisher's exact test on signal-fired vs. background win/loss counts.
+
+    The "signal fired" side (a, b) now uses episode-start days only, for the
+    same reason score_signal does -- treating every day of a long persistent
+    state as an independent Bernoulli trial badly overstates the evidence
+    Fisher's test thinks it has. The background side (c, d) intentionally
+    stays at row-level: it represents "any day in the series" as the null/
+    comparison population, which is a separate (and much larger) overlapping-
+    windows issue common to every signal equally, not specific to state-type
+    signals -- not in scope for this fix.
+    """
     harr = horizon_arrays.get(horizon)
     if harr is None:
         return np.nan
@@ -615,8 +738,10 @@ def fisher_p_value(mask_arr: np.ndarray, direction: str,
     mfe_full      = harr[mfe_key]
     min_move_full = harr["min_move"]
 
+    episode_mask = get_episode_start_mask(mask_arr)
+
     valid     = valid_class & ~np.isnan(mfe_full) & ~np.isnan(min_move_full)
-    sig_valid = valid & mask_arr
+    sig_valid = valid & episode_mask
 
     all_mfe, all_min_move = mfe_full[valid], min_move_full[valid]
     sig_mfe, sig_min_move = mfe_full[sig_valid], min_move_full[sig_valid]
@@ -653,7 +778,20 @@ def build_combo_mask(signal_names, signal_map_np: Dict[str, np.ndarray]) -> np.n
 # PER-SYMBOL PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_symbol(filepath: str, test_triples: bool = False) -> Optional[pd.DataFrame]:
+def run_symbol(filepath: str, test_triples: bool = False,
+               exclude_concentrated: bool = True,
+               concentration_threshold: Optional[float] = None) -> Optional[pd.DataFrame]:
+    """
+    exclude_concentrated: when True (default), signals whose Concentration_Flag
+    is set are dropped before the top-N-per-direction selection, so a single
+    outlier-driven signal can't crowd a genuinely repeatable one out of the
+    saved CSV. They're excluded from the *ranking*, not silently deleted from
+    existence -- run with exclude_concentrated=False (or --keep-concentrated
+    on the CLI) to see them alongside everything else, e.g. for manual review.
+    concentration_threshold: overrides the module-level CONCENTRATION_THRESHOLD
+    for this run's filtering decision only (does not change how
+    MaxTop1TradeShare itself is computed).
+    """
     try:
         df = pd.read_csv(filepath, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
     except Exception as e:
@@ -748,11 +886,27 @@ def run_symbol(filepath: str, test_triples: bool = False) -> Optional[pd.DataFra
     result_df = pd.DataFrame(rows)
     result_df["Symbol"]  = symbol
     result_df["Company"] = company
-    result_df = result_df.sort_values("CompositeScore", ascending=False)
 
-    bull_top = result_df[result_df["Direction"] == "Bullish"].head(TOP_N_PER_DIR)
-    bear_top = result_df[result_df["Direction"] == "Bearish"].head(TOP_N_PER_DIR)
+    thresh = concentration_threshold if concentration_threshold is not None else CONCENTRATION_THRESHOLD
+    if exclude_concentrated:
+        over_thresh = result_df["MaxTop1TradeShare"].fillna(0) > thresh
+        n_excluded = int((over_thresh).sum())
+        rankable_df = result_df[~over_thresh].copy()
+        if VERBOSE and n_excluded:
+            print(f"    ({n_excluded} outlier-concentrated signal(s) excluded from ranking for {symbol}, "
+                  f"MaxTop1TradeShare > {thresh})")
+    else:
+        rankable_df = result_df
+
+    rankable_df = rankable_df.sort_values("CompositeScore", ascending=False)
+
+    bull_top = rankable_df[rankable_df["Direction"] == "Bullish"].head(TOP_N_PER_DIR)
+    bear_top = rankable_df[rankable_df["Direction"] == "Bearish"].head(TOP_N_PER_DIR)
     top_df   = pd.concat([bull_top, bear_top], ignore_index=True)
+
+    if top_df.empty:
+        if VERBOSE: print(f"  [SKIP] No rankable signals for {symbol} after concentration filter")
+        return None
 
     out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
     top_df.to_csv(out_path, index=False)
@@ -769,15 +923,19 @@ def build_leaderboard(all_results: list) -> pd.DataFrame:
     combined      = pd.concat(all_results, ignore_index=True)
     total_symbols = combined["Symbol"].nunique()
     agg = combined.groupby(["SignalName", "Direction", "HorizonClass"]).agg(
-        Symbol_Count      = ("Symbol",         "nunique"),
-        Avg_Composite     = ("CompositeScore",  "mean"),
-        Avg_EV            = ("AvgEV",           "mean"),
-        Avg_WinRate       = ("AvgWinRate",      "mean"),
-        Avg_ProfitFactor  = ("AvgProfitFactor", "mean"),
-        Avg_Consistency   = ("Consistency",     "mean"),
-        Avg_Count         = ("Count",           "mean"),
+        Symbol_Count        = ("Symbol",              "nunique"),
+        Avg_Composite       = ("CompositeScore",       "mean"),
+        Avg_EV              = ("AvgEV",                "mean"),
+        Avg_WinRate         = ("AvgWinRate",            "mean"),
+        Avg_ProfitFactor    = ("AvgProfitFactor",       "mean"),
+        Avg_Consistency     = ("Consistency",           "mean"),
+        Avg_Count           = ("Count",                 "mean"),
+        Avg_MedianReturn    = ("AvgMedianReturn",       "mean"),
+        Avg_Top1TradeShare  = ("MaxTop1TradeShare",     "mean"),
+        Pct_Concentrated    = ("Concentration_Flag",    "mean"),
     ).reset_index()
     agg["Prevalence_%"] = (agg["Symbol_Count"] / total_symbols * 100).round(1)
+    agg["Pct_Concentrated"] = (agg["Pct_Concentrated"] * 100).round(1)
     agg = agg.sort_values("Avg_Composite", ascending=False)
 
     out_path = os.path.join(OUTPUT_FOLDER, "NSE_signal_leaderboard.csv")
@@ -789,24 +947,45 @@ def build_leaderboard(all_results: list) -> pd.DataFrame:
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _run_symbol_worker(args):
+    """Thin wrapper so run_symbol's extra kwargs can travel through
+    ProcessPoolExecutor.submit (which needs a single positional-args tuple
+    when the target isn't a plain top-level call with keyword args baked in
+    at submit time)."""
+    filepath, test_triples, exclude_concentrated, concentration_threshold = args
+    return run_symbol(filepath, test_triples=test_triples,
+                       exclude_concentrated=exclude_concentrated,
+                       concentration_threshold=concentration_threshold)
+
+
 def main():
     parser = argparse.ArgumentParser(description="NSE Signal Scanner v2")
     parser.add_argument("--symbol",    type=str, default=None, help="Single symbol only")
     parser.add_argument("--triples",   action="store_true",    help="Test triple combos (slow)")
     parser.add_argument("--no-fisher", action="store_true",    help="Skip Fisher p-values")
     parser.add_argument("--workers",   type=int, default=None, help="Parallel worker processes (default: CPU count)")
+    parser.add_argument("--max-concentration", type=float, default=None,
+                         help=f"Override CONCENTRATION_THRESHOLD (default {CONCENTRATION_THRESHOLD}) "
+                              f"for excluding outlier-driven signals from the top-N ranking")
+    parser.add_argument("--keep-concentrated", action="store_true",
+                         help="Do not exclude outlier-concentrated signals from the top-N ranking "
+                              "(they still get MaxTop1TradeShare/Concentration_Flag columns either way)")
     args = parser.parse_args()
 
     global COMPUTE_FISHER
     if args.no_fisher:
         COMPUTE_FISHER = False
 
+    exclude_concentrated = not args.keep_concentrated
+
     if args.symbol:
         fp = os.path.join(INPUT_FOLDER, f"{args.symbol}{DATA_SUFFIX}")
         if not os.path.exists(fp):
             print(f"File not found: {fp}")
             return
-        run_symbol(fp, test_triples=args.triples)
+        run_symbol(fp, test_triples=args.triples,
+                   exclude_concentrated=exclude_concentrated,
+                   concentration_threshold=args.max_concentration)
         return
 
     files = sorted(glob.glob(os.path.join(INPUT_FOLDER, f"*{DATA_SUFFIX}")))
@@ -820,7 +999,8 @@ def main():
     all_results = []
     done = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {executor.submit(run_symbol, fp, args.triples): fp for fp in files}
+        job_args = [(fp, args.triples, exclude_concentrated, args.max_concentration) for fp in files]
+        futures = {executor.submit(_run_symbol_worker, ja): ja[0] for ja in job_args}
         for future in as_completed(futures):
             fp = futures[future]
             done += 1
