@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from config.tickers import TICKERS
+from config.tickers import TICKERS  
 
 DATA_DIR = "data/technical"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -25,15 +25,23 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # unbroken run of real trading days.
 GAP_THRESHOLD_DAYS = 45
 
-# An overnight raw-price move whose split-adjusted return (from Adj Close)
-# differs from its raw return (from Close) by more than this fraction is
-# treated as a split / bonus issue / rights issue, not a genuine market move.
-# yfinance's raw "Close" (auto_adjust=False) is NOT split-adjusted, so a
-# stock split/bonus shows up as a large overnight jump/drop in raw Close with
-# no matching jump in Adj Close. Left unadjusted, that fake return flows
-# straight into Fwd_Close_*D / MFE_*D in signal_scanner.py and produces
-# absurd AvgEV/ProfitFactor numbers for the affected stock.
-CORP_ACTION_THRESHOLD = 0.15
+# How many percentage points of mismatch between an old cached Close and a
+# freshly re-fetched Close (for the *same* historical date) counts as
+# evidence that a split/bonus/rights issue has happened since the ticker was
+# last updated. Splits and bonuses are applied *retroactively* by Yahoo --
+# every already-cached row silently goes stale the moment a new corporate
+# action occurs, even though nothing about those rows "looks" wrong on their
+# own. Ordinary cash dividends also nudge Adj-Close-based series by a small,
+# continuous amount (typically well under 1% per dividend); the threshold is
+# set high enough to ignore that routine drift and only fire on the kind of
+# large, discontinuous jump a split/bonus/rights issue produces (Best
+# Agrolife's Jan-2026 10:1 split + 1:2 bonus was ~15x; Cupid's 1:10 split +
+# 1:1 bonus was ~20x) -- not the ~0.1-1% nudges of a normal dividend.
+ADJUSTMENT_TOLERANCE = 0.03
+# Trading days at the tail of the existing cache to re-fetch and compare
+# against on every run, purely to check whether they're still on the same
+# adjustment basis they were saved under.
+OVERLAP_CHECK_DAYS = 10
 
 # Start and end dates
 START_DATE = "2021-01-01"
@@ -41,9 +49,6 @@ END_DATE = datetime.today().strftime("%Y-%m-%d")
 # yf.download's `end` is exclusive, so requesting end=END_DATE would never
 # actually fetch today's session -- push the request window one day further.
 FETCH_END = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-RAW_COLS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
-
 
 def add_indicators(df):
     close = df["Close"].astype(float).values
@@ -102,54 +107,11 @@ def add_indicators(df):
     return df
 
 
-def detect_and_adjust_corporate_actions(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Detect split / bonus / rights-issue events and back-adjust raw OHLC so
-    the price series is continuous across them.
-
-    yfinance's raw "Close" (auto_adjust=False) is NOT split-adjusted, but
-    "Adj Close" is. So factor = AdjClose / Close is flat day-to-day except
-    it jumps exactly on a corporate-action ex-date (a 1:1 bonus roughly
-    doubles the factor since Close mechanically halves while AdjClose stays
-    smooth; a reverse split moves it the other way). Detect those jumps and
-    divide every row *before* the event by the jump ratio, which brings the
-    pre-event OHLC onto the same scale as the post-event OHLC -- i.e. the
-    same kind of back-adjustment AdjClose already represents, but applied to
-    Open/High/Low/Close together so they all stay internally consistent
-    (candlestick patterns, ATR, etc. need High/Low/Open adjusted too, not
-    just Close).
-
-    Must run on the FULL raw history (old + newly fetched rows) every time,
-    not just the new rows -- the adjustment reaches back over the whole
-    file whenever a new corporate action is discovered.
-    """
-    df = df.sort_values("Date").reset_index(drop=True).copy()
-    if "Adj Close" not in df.columns or df.empty:
-        return df
-
-    factor = df["Adj Close"] / df["Close"].replace(0, np.nan)
-    factor_ratio = factor / factor.shift(1)
-    event_idx = factor_ratio[(factor_ratio - 1).abs() > CORP_ACTION_THRESHOLD].index
-
-    for idx in event_idx:
-        ratio = factor_ratio.loc[idx]
-        if pd.isna(ratio) or ratio <= 0:
-            continue
-        mask = df.index < idx
-        for col in ["Open", "High", "Low", "Close"]:
-            df.loc[mask, col] = df.loc[mask, col] / ratio
-
-    return df
-
-
 def assign_segments(df):
     """Number each row by which unbroken run of real trading days it belongs
     to -- increments every time the gap since the previous real trade exceeds
     GAP_THRESHOLD_DAYS. Must run after clean_raw() so gaps reflect real
-    trading days only, not zero-volume stale-quote rows. Must also run after
-    detect_and_adjust_corporate_actions() -- that fix handles price-scale
-    discontinuities (splits/bonuses) where trading never actually stopped, so
-    it must not also trip the gap-based segment break."""
+    trading days only, not zero-volume stale-quote rows."""
     df = df.copy()
     if df.empty:
         df["Segment"] = pd.Series(dtype=int)
@@ -185,6 +147,14 @@ def add_fundamentals(ticker, df):
         print(f"Failed to fetch fundamentals for {ticker}: {e}")
         return df
 
+# NOTE: no "Adj Close" column anymore. Downloads now use auto_adjust=True (see
+# _download() below), so the "Close" column returned by yfinance already *is*
+# the split/dividend-adjusted price -- a separate Adj Close column would just
+# be a duplicate of Close, not a different, more-correct series to fall back
+# on. See ADJUSTMENT_TOLERANCE / _detect_retroactive_adjustment for how stale
+# (pre-existing corporate-action) cached rows are handled.
+RAW_COLS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+
 
 def clean_raw(df):
     """Drop rows with zero (or missing) volume -- these are not real trading
@@ -200,19 +170,99 @@ def clean_raw(df):
     return df[df["Volume"] > 0].reset_index(drop=True)
 
 
+def _download(yf_ticker, start, end):
+    """Thin wrapper around yf.download that always requests split/dividend-
+    adjusted prices and normalizes the result to RAW_COLS.
+
+    auto_adjust=True (rather than the previous auto_adjust=False +
+    a separate "Adj Close" column) means Open/High/Low/Close all come back
+    already rescaled for every split and bonus issue Yahoo knows about, as of
+    the moment of the request -- not just Close, and not left for downstream
+    code to reconcile itself. This is what actually fixes the corporate-action
+    bug: previously Close carried the raw, un-rescaled price, so a stock like
+    BESTAGRO (10:1 split + 1:2 bonus, effectively ~15x, Jan 2026) or CUPID
+    (1:10 split + 1:1 bonus, ~20x, Apr 2024) would show a fake multi-hundred-
+    percent single-day "return" on its record date, corrupting every
+    indicator and forward-return window that touched it.
+    """
+    fetched = yf.download(
+        yf_ticker,
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+    if fetched.empty:
+        return pd.DataFrame(columns=RAW_COLS)
+    if isinstance(fetched.columns, pd.MultiIndex):
+        fetched.columns = [c[0] for c in fetched.columns]
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        fetched[col] = pd.to_numeric(fetched[col], errors="coerce")
+    fetched = fetched.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    if fetched.empty:
+        return pd.DataFrame(columns=RAW_COLS)
+    fetched = fetched.reset_index()
+    return clean_raw(fetched[RAW_COLS])
+
+
+def _detect_retroactive_adjustment(yf_ticker, old_df):
+    """Re-fetch the most recent OVERLAP_CHECK_DAYS of already-cached trading
+    days and compare their (adjusted) Close against what's on disk.
+
+    Splits/bonuses/rights issues are applied retroactively: an adjusted Close
+    from six months ago is a different number today than it was the day
+    before a new split, even though nothing about that row's Date/Open/High/
+    Low/Close individually looks wrong. A plain incremental "fetch only what's
+    missing and append" scheme (the previous behaviour) has no way to notice
+    this -- it will happily keep appending correctly-adjusted new rows onto a
+    stale-basis history forever. Returns True if a large, split/bonus-sized
+    discrepancy is found (see ADJUSTMENT_TOLERANCE for what counts as
+    "large" vs. routine dividend drift), meaning the cached history for this
+    ticker can no longer be trusted and needs a full re-fetch rather than an
+    incremental merge.
+    """
+    if old_df is None or old_df.empty:
+        return False
+    recent = old_df.sort_values("Date").tail(OVERLAP_CHECK_DAYS)
+    if recent.empty:
+        return False
+    start = recent["Date"].min().strftime("%Y-%m-%d")
+    end = (recent["Date"].max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    check = _download(yf_ticker, start, end)
+    if check.empty:
+        return False
+    merged = recent.merge(check[["Date", "Close"]], on="Date", suffixes=("_old", "_new"))
+    if merged.empty:
+        return False
+    ratio = (merged["Close_new"] / merged["Close_old"]).replace([np.inf, -np.inf], np.nan).dropna()
+    if ratio.empty:
+        return False
+    return bool((ratio - 1.0).abs().max() > ADJUSTMENT_TOLERANCE)
+
+
 def update_ticker(ticker, force_clean=False):
     """Fetch and merge only the missing days for one ticker, then recompute
     indicators over the full price history. Returns (ticker, status_string,
     error_or_None) -- returned as a tuple (rather than printed directly)
-    because this function now runs inside a worker process under
+    because this function runs inside a worker process under
     ProcessPoolExecutor, and worker stdout doesn't reliably interleave with
     the parent process's prints.
 
-    force_clean=True also rebuilds tickers with no new data to fetch -- this
-    covers zero-volume stripping, corporate-action back-adjustment, and
-    segment/indicator recomputation after a change to any of that logic,
-    since "already up to date" would otherwise skip a ticker entirely and
-    never pick up a fix.
+    force_clean=True now forces a full re-fetch from START_DATE (not just a
+    local recompute over the existing cached raw prices). This is stronger
+    than it used to be, and deliberately so: _detect_retroactive_adjustment
+    (below) only compares the most recent OVERLAP_CHECK_DAYS of cached data
+    against a fresh fetch, which catches a split/bonus that happens *after*
+    a ticker was last updated -- but it can't see one that's already sitting,
+    undetected, in the *middle* of a file that was built incrementally under
+    a version of this script that didn't adjust for corporate actions at all
+    (which is exactly how BESTAGRO's and CUPID's caches were likely built).
+    The only way to guarantee those already-baked-in discontinuities get
+    caught and corrected is a genuine full re-fetch, which is what --clean
+    now does. Run it once across the whole universe after adopting this fix;
+    the lightweight tail-check below is what keeps things correct on an
+    ongoing, incremental basis after that.
     """
     file_path = os.path.join(DATA_DIR, f"{ticker}_data.csv")
 
@@ -225,36 +275,37 @@ def update_ticker(ticker, force_clean=False):
             orig_len = len(old_df)
             old_df = clean_raw(old_df)
             removed = orig_len - len(old_df)
-            if not old_df.empty:
-                last_date = old_df["Date"].max()
-                fetch_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-
-    has_new_data = fetch_start <= END_DATE
-    if not has_new_data and not force_clean:
-        return ticker, "already up to date", None
 
     yf_ticker = f"{ticker}.NS" if not ticker.endswith((".NS", ".BO")) else ticker
-    new_df = pd.DataFrame(columns=RAW_COLS)
 
     try:
-        if has_new_data:
-            fetched = yf.download(
-                yf_ticker,
-                start=fetch_start,
-                end=FETCH_END,
-                interval="1d",
-                auto_adjust=False,
-                progress=False
-            )
-            if not fetched.empty:
-                if isinstance(fetched.columns, pd.MultiIndex):
-                    fetched.columns = [c[0] for c in fetched.columns]
-                for col in ["Open", "High", "Low", "Close", "Volume"]:
-                    fetched[col] = pd.to_numeric(fetched[col], errors="coerce")
-                fetched = fetched.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-                if not fetched.empty:
-                    fetched.reset_index(inplace=True)
-                    new_df = clean_raw(fetched[RAW_COLS])
+        rebuilt_for_adjustment = False
+        if force_clean:
+            # --clean means "don't trust the cache at all" -- skip the
+            # tail-only detection check (it would just cost a network call to
+            # confirm what we're about to do unconditionally anyway) and go
+            # straight to a full rebuild.
+            if old_df is not None and not old_df.empty:
+                rebuilt_for_adjustment = True
+                old_df = None
+                removed = 0
+        elif old_df is not None and not old_df.empty:
+            if _detect_retroactive_adjustment(yf_ticker, old_df):
+                rebuilt_for_adjustment = True
+                old_df = None
+                removed = 0
+
+        if old_df is not None and not old_df.empty:
+            last_date = old_df["Date"].max()
+            fetch_start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+        has_new_data = fetch_start <= END_DATE
+        if not has_new_data and not force_clean and not rebuilt_for_adjustment:
+            return ticker, "already up to date", None
+
+        new_df = pd.DataFrame(columns=RAW_COLS)
+        if has_new_data or rebuilt_for_adjustment:
+            new_df = _download(yf_ticker, fetch_start, FETCH_END)
 
         # Merge with the existing raw price history (not the old indicator
         # columns) before recomputing indicators, since things like EMA_200
@@ -273,16 +324,11 @@ def update_ticker(ticker, force_clean=False):
         else:
             return ticker, "no valid data", None
 
-        # Back-adjust for splits/bonuses/rights issues BEFORE segmenting on
-        # trading gaps -- a corporate action is a price-scale discontinuity,
-        # not a trading halt, so it must not also trip GAP_THRESHOLD_DAYS.
-        combined_raw = detect_and_adjust_corporate_actions(combined_raw)
-
         combined_raw = assign_segments(combined_raw)
         combined = add_indicators_by_segment(combined_raw)
 
         fundamental_cols = ["MarketCap", "PE", "EPS", "PB", "DividendYield"]
-        if has_new_data:
+        if has_new_data or rebuilt_for_adjustment:
             combined = add_fundamentals(yf_ticker, combined)
         elif old_df is not None and all(c in old_df.columns for c in fundamental_cols):
             # No new rows fetched, so nothing about the company changed --
@@ -292,12 +338,13 @@ def update_ticker(ticker, force_clean=False):
                 combined[col] = old_df[col].iloc[-1]
         else:
             combined = add_fundamentals(yf_ticker, combined)
-
         combined.to_csv(file_path, index=False)
 
         n_segments = combined["Segment"].nunique()
 
         parts = []
+        if rebuilt_for_adjustment:
+            parts.append("rebuilt: full re-fetch (--clean or detected split/bonus)")
         if removed:
             parts.append(f"removed {removed} zero-volume rows")
         if len(new_df):
@@ -314,9 +361,12 @@ def update_ticker(ticker, force_clean=False):
 def main():
     parser = argparse.ArgumentParser(description="Fetch/update NSE technical data")
     parser.add_argument("--clean", action="store_true",
-                         help="Force-rebuild every ticker's cleaning/segmenting/corporate-action-adjustment/indicators, even ones with no new data to fetch")
+                         help="Force a full re-fetch (not just a local recompute) for every ticker, "
+                              "even ones with no new data -- run this once after adopting the "
+                              "corporate-action fix to catch splits/bonuses already baked into old caches")
     parser.add_argument("--workers", type=int, default=None,
-                         help="Parallel worker processes (default: min(CPU count, 8), since this is a network-bound task and too many workers just hits Yahoo's rate limits)")
+                         help="Parallel worker processes (default: min(CPU count, 8), since this is a "
+                              "network-bound task and too many workers just hits Yahoo's rate limits)")
     parser.add_argument("--ticker", type=str, default=None,
                          help="Update a single ticker only (skips parallelization)")
     args = parser.parse_args()
