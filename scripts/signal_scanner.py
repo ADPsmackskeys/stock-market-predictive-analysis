@@ -21,6 +21,18 @@ Changes in this revision:
   - Aggregate MaxTop1TradeShare / AvgMedianReturn and a Concentration_Flag,
     used to keep outlier-driven signals from crowding out genuinely
     repeatable ones at the top of the per-symbol and cross-symbol outputs.
+  - Per-horizon WinRate_HitEV_{h}D / aggregate AvgWinRate_HitEV: fraction of
+    occurrences whose actual (raw, signed) realized return cleared this
+    horizon's EV. A low WinRate_HitEV next to a high WinRate_MFE is a tell
+    that EV is being carried by a handful of big occurrences rather than
+    being a typical outcome -- a second, independent outlier lens alongside
+    MedianReturn_Close and Top1_Trade_Share. This is also the field
+    live_signal_scan.py's AvgWinRate_HitEV pass-through depends on.
+  - ProfitFactor_{h}D / AvgProfitFactor report the RAW (uncapped) ratio, not
+    the PF_CAP-limited one -- capping only happens where PF is used
+    *multiplicatively* in CompositeScore_{h}D / CompositeScore. An absurd
+    raw ProfitFactor (e.g. 80+) stays visible in the CSV as a red flag even
+    after the score itself has been hardened against it.
 
 Usage:
     python signal_scanner.py
@@ -88,6 +100,30 @@ ATR_THRESHOLD_K = 0.15
 # pattern, even though Count clears MIN_OCCURRENCES. See Top1_Trade_Share_{h}D
 # / MaxTop1TradeShare / Concentration_Flag below.
 CONCENTRATION_THRESHOLD = 0.40
+
+# Per-trade signed returns are winsorized to [WINSOR_PCTL, 100-WINSOR_PCTL]
+# percentile of that same occurrence's own return distribution before they
+# feed AvgWin/AvgLoss/EV/ProfitFactor/CompositeScore. This does NOT touch
+# AvgReturn_Close_{h}D, MedianReturn_Close_{h}D, or Top1_Trade_Share_{h}D --
+# those stay computed on the raw, unclipped returns so they keep working as
+# outlier *diagnostics* (a raw mean/median gap or a high top-1 share is still
+# visible even after the scoring itself has been hardened against it). With
+# small samples (Count often 10-60) a symmetric 2% trim mostly just caps the
+# single most extreme observation on each side rather than doing anything to
+# the bulk of the distribution -- that's the point: one huge trade can still
+# dent EV, it just can't make EV (and therefore CompositeScore) explode.
+WINSOR_PCTL = 2.0
+
+# Ceiling on ProfitFactor used wherever it multiplies into a composite score
+# (CompositeScore_{h}D / CompositeScore). Gross_loss for a signal with
+# few/small losing trades can be tiny, so profit_factor =
+# gross_profit/gross_loss is a ratio of two things that can each swing a lot
+# on a small sample -- capping it (at the point of multiplication only, not
+# in the reported ProfitFactor_{h}D/AvgProfitFactor columns) stops one signal
+# with almost no losers from scoring 100-1000x higher than one with a normal
+# loss profile, even after the return-level winsorizing above, while still
+# leaving the raw ratio visible in the output as a diagnostic.
+PF_CAP = 10.0
 
 # Signal name → horizon class
 SIGNAL_HORIZON_CLASS = {
@@ -555,26 +591,43 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
       WinRate_MFE  — % of occurrences where MFE exceeded the ATR-normalized threshold
       AvgWin       — average close-at-N return on winning occurrences
       AvgLoss      — average close-at-N return on losing occurrences
-      EV           — Expected Value = win_rate × avg_win + loss_rate × avg_loss
-      ProfitFactor — gross profit / gross loss
+      EV           — Expected Value = win_rate × avg_win + loss_rate × avg_loss,
+                     computed from per-trade returns winsorized to the
+                     [WINSOR_PCTL, 100-WINSOR_PCTL] percentile of that
+                     occurrence set's own return distribution -- one huge
+                     trade can still move EV, it just can't dominate it.
+      ProfitFactor — gross profit / gross loss, from the same winsorized
+                     returns, REPORTED RAW/UNCAPPED here so an absurd value
+                     stays visible as a diagnostic red flag. It's only capped
+                     at PF_CAP at the point it's used *multiplicatively* in
+                     CompositeScore_{h}D -- a tiny gross_loss on a small
+                     sample can otherwise blow this ratio up by orders of
+                     magnitude and dominate the composite score on its own.
       MedianReturn_Close_{h}D — median (not mean) close-at-N return across all
                      occurrences. A large gap between this and
                      AvgReturn_Close_{h}D is itself a signal that the mean is
                      being pulled around by a handful of outlier trades rather
                      than reflecting a typical occurrence.
+      WinRate_HitEV_{h}D — fraction of occurrences whose actual (raw, signed)
+                     realized return cleared this horizon's EV. A low
+                     WinRate_HitEV next to a high WinRate_MFE is a tell that
+                     EV is being carried by a handful of big occurrences
+                     rather than being a typical outcome -- a second,
+                     independent outlier lens alongside MedianReturn_Close.
       Top1_Trade_Share_{h}D — fraction of this horizon's gross profit
                      contributed by the single largest winning trade. High
                      values (see CONCENTRATION_THRESHOLD) mean the apparent
                      edge is riding on one idiosyncratic event, not a
                      repeatable pattern, even when Count clears
                      MIN_OCCURRENCES.
-      CompositeScore_{h}D — per-horizon quality score (EV × max(PF,1) × log1p(count))
+      CompositeScore_{h}D — per-horizon quality score (EV × max(min(PF,PF_CAP),1) × log1p(count))
 
     Aggregate metrics (across all horizons in the signal's class):
       Consistency    — 1 - range of win rates across horizons
-      CompositeScore — EV × max(PF,1) × consistency × log1p(count)
+      CompositeScore — EV × max(min(PF,PF_CAP),1) × consistency × log1p(count)
       BestHorizon    — horizon with the highest CompositeScore_{h}D
       AvgMedianReturn      — mean, across horizons, of MedianReturn_Close_{h}D
+      AvgWinRate_HitEV     — mean, across horizons, of WinRate_HitEV_{h}D
       MaxTop1TradeShare    — the largest Top1_Trade_Share_{h}D across horizons
       Concentration_Flag   — 1 if MaxTop1TradeShare exceeds
                               CONCENTRATION_THRESHOLD, else 0
@@ -610,7 +663,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
 
     result = {"Count": count, "HorizonClass": hclass, "Direction": direction}
     all_evs, all_srs, all_pfs, horizon_composites = [], [], [], []
-    all_medians, all_top1_shares = [], []
+    all_medians, all_top1_shares, all_hitrates = [], [], []
     mfe_key    = "mfe_bull" if direction == "Bullish" else "mfe_bear"
     multiplier = 1.0 if direction == "Bullish" else -1.0
 
@@ -641,46 +694,106 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         wins   = rv[win_mask]
         losses = rv[~win_mask]
 
-        avg_win  = float(wins.mean())  if wins.size   > 0 else 0.0
-        avg_loss = float(losses.mean()) if losses.size > 0 else 0.0
+        # --- Winsorize signed returns before they feed any scoring metric
+        # that gets multiplied into CompositeScore. Uses this occurrence
+        # set's own [WINSOR_PCTL, 100-WINSOR_PCTL] percentile as the clip
+        # bounds, so the cap adapts to each signal's own return scale
+        # instead of a single fixed number across every stock/signal. The
+        # *diagnostic* columns (AvgReturn_Close, MedianReturn_Close,
+        # Top1_Trade_Share, WinRate_HitEV below) deliberately keep using the
+        # raw, unclipped `rv`/`wins` so a hardened score doesn't also hide
+        # the fact that an outlier was there.
+        if rv.size > 0:
+            lo, hi = np.percentile(rv, [WINSOR_PCTL, 100 - WINSOR_PCTL])
+            rv_wins = np.clip(rv, lo, hi)
+        else:
+            rv_wins = rv
+        wins_w   = rv_wins[win_mask]
+        losses_w = rv_wins[~win_mask]
+
+        avg_win  = float(wins_w.mean())  if wins_w.size   > 0 else 0.0
+        avg_loss = float(losses_w.mean()) if losses_w.size > 0 else 0.0
 
         ev = win_rate * avg_win + loss_rate * avg_loss
 
-        neg_losses   = losses[losses < 0]
-        pos_wins     = wins[wins > 0]
-        gross_profit = float(pos_wins.sum()) if pos_wins.size > 0 else 0.0
-        gross_loss   = float(np.abs(neg_losses).sum()) if neg_losses.size > 0 else 1e-9
-        pf = gross_profit / gross_loss if gross_loss > 1e-9 else np.nan
+        neg_losses_w   = losses_w[losses_w < 0]
+        pos_wins_w     = wins_w[wins_w > 0]
+        gross_profit_w = float(pos_wins_w.sum()) if pos_wins_w.size > 0 else 0.0
+        gross_loss_w   = float(np.abs(neg_losses_w).sum()) if neg_losses_w.size > 0 else 1e-9
+        pf_raw = gross_profit_w / gross_loss_w if gross_loss_w > 1e-9 else np.nan
+        # Capped version used ONLY where PF multiplies into a composite
+        # score -- the reported ProfitFactor_{h}D column below stays raw.
+        pf_for_composite = min(pf_raw, PF_CAP) if not np.isnan(pf_raw) else 0.0
 
         # Median close-at-N return, unsigned (matches AvgReturn_Close_{h}D's
         # convention) -- compare the two directly to spot a mean pulled
-        # around by a handful of outlier occurrences.
+        # around by a handful of outlier occurrences. Computed on the RAW
+        # close_vals, not the winsorized returns, so it still reflects reality.
         median_return = float(np.median(close_vals))
 
+        # Fraction of occurrences whose actual (raw, signed) realized return
+        # cleared this horizon's EV -- a second, independent outlier lens:
+        # low WinRate_HitEV next to a high WinRate_MFE means EV is being
+        # carried by a handful of big occurrences, not a typical outcome.
+        hit_ev_mask    = rv >= ev
+        winrate_hit_ev = float(hit_ev_mask.mean())
+
         # Share of this horizon's gross profit coming from its single
-        # largest winning trade. NaN when there's no gross profit to share
-        # (no winning trades) -- that's a "can't compute" case, not a "0%
-        # concentration" case, so it's kept out of the composite/aggregate
-        # rather than silently treated as safe.
+        # largest winning trade -- computed on RAW (unwinsorized) wins/gross
+        # profit so it still flags an outlier that the hardened EV/PF/
+        # CompositeScore above may have already capped away. NaN when there's
+        # no gross profit to share (no winning trades) -- that's a "can't
+        # compute" case, not a "0% concentration" case, so it's kept out of
+        # the composite/aggregate rather than silently treated as safe.
+        neg_losses   = losses[losses < 0]
+        pos_wins     = wins[wins > 0]
+        gross_profit = float(pos_wins.sum()) if pos_wins.size > 0 else 0.0
         top1_share = (float(pos_wins.max()) / gross_profit) if (gross_profit > 1e-9 and pos_wins.size > 0) else np.nan
 
-        composite_h = round(ev * max(pf if not np.isnan(pf) else 0.0, 1.0) * np.log1p(count), 6)
+        # --- Quantile-based (not mean-based) scale-out targets, from the
+        # RAW mfe_vals distribution (best price reached within the window),
+        # across ALL occurrences for this horizon -- wins and losses alike,
+        # since "what level did X% of signal-firings reach" should be judged
+        # against every time the signal fired, not just the ones that
+        # happened to clear the ATR-based win threshold.
+        #
+        # A quantile is not an average: unlike AvgWin/AvgEV, one outlier
+        # trade can shift a percentile only by nudging its rank, not by
+        # dragging the whole statistic toward it the way a mean does -- this
+        # is deliberately built to survive the exact kind of single-trade
+        # distortion that AvgWinRate_HitEV (~30-40% here) shows AvgEV
+        # suffers from.
+        #
+        # MFE_Target_P20_{h}D -- the level ~80% of occurrences reached
+        #   (100-20=80% of the distribution is at or above the 20th
+        #   percentile) -- conservative, near, high-confidence target.
+        # MFE_Target_P50_{h}D -- the median -- ~50% of occurrences reached it.
+        # MFE_Target_P80_{h}D -- the level only ~20% of occurrences reached
+        #   -- the stretch target.
+        p20, p50, p80 = np.percentile(mfe_vals, [20, 50, 80])
+
+        composite_h = round(ev * max(pf_for_composite, 1.0) * np.log1p(count), 6)
 
         result[f"WinRate_MFE_{h}D"]        = round(win_rate, 4)
         result[f"AvgWin_{h}D"]             = round(avg_win, 5)
         result[f"AvgLoss_{h}D"]            = round(avg_loss, 5)
         result[f"EV_{h}D"]                 = round(ev, 6)
-        result[f"ProfitFactor_{h}D"]       = round(pf, 3) if not np.isnan(pf) else np.nan
+        result[f"ProfitFactor_{h}D"]       = round(pf_raw, 3) if not np.isnan(pf_raw) else np.nan
         result[f"AvgReturn_Close_{h}D"]    = round(float(close_vals.mean()), 5)
         result[f"MedianReturn_Close_{h}D"] = round(median_return, 5)
+        result[f"WinRate_HitEV_{h}D"]      = round(winrate_hit_ev, 4)
         result[f"AvgMinMovePct_{h}D"]      = round(float(min_move_vals.mean()) * 100, 3)
         result[f"Top1_Trade_Share_{h}D"]   = round(top1_share, 4) if not np.isnan(top1_share) else np.nan
+        result[f"MFE_Target_P20_{h}D"]     = round(float(p20), 5)
+        result[f"MFE_Target_P50_{h}D"]     = round(float(p50), 5)
+        result[f"MFE_Target_P80_{h}D"]     = round(float(p80), 5)
         result[f"CompositeScore_{h}D"]     = composite_h
 
         all_evs.append(ev)
         all_srs.append(win_rate)
-        all_pfs.append(pf if not np.isnan(pf) else 0.0)
+        all_pfs.append(pf_raw if not np.isnan(pf_raw) else 0.0)
         all_medians.append(median_return)
+        all_hitrates.append(winrate_hit_ev)
         if not np.isnan(top1_share):
             all_top1_shares.append(top1_share)
         horizon_composites.append((h, composite_h))
@@ -688,18 +801,33 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
     if not all_evs:
         return None
 
-    avg_ev   = float(np.mean(all_evs))
-    avg_sr   = float(np.mean(all_srs))
-    avg_pf   = float(np.mean([p for p in all_pfs if p > 0])) if any(p > 0 for p in all_pfs) else 0.0
+    avg_ev      = float(np.mean(all_evs))
+    avg_sr      = float(np.mean(all_srs))
+    # AvgProfitFactor is the mean of the RAW per-horizon ratios (diagnostic);
+    # avg_pf_for_composite is the separately-capped value used in scoring.
+    avg_pf = float(np.mean([p for p in all_pfs if p > 0])) if any(p > 0 for p in all_pfs) else 0.0
+    avg_pf_for_composite = min(avg_pf, PF_CAP)
+    avg_median  = float(np.mean(all_medians)) if all_medians else np.nan
+    avg_hitrate = float(np.mean(all_hitrates)) if all_hitrates else np.nan
     sr_range = max(all_srs) - min(all_srs) if len(all_srs) > 1 else 0.0
     consistency = max(1.0 - sr_range, 0.0)
 
-    composite = round(avg_ev * max(avg_pf, 1.0) * consistency * np.log1p(count), 6)
+    composite = round(avg_ev * max(avg_pf_for_composite, 1.0) * consistency * np.log1p(count), 6)
     best_h, best_h_composite = max(horizon_composites, key=lambda t: t[1])
 
-    avg_median      = float(np.mean(all_medians)) if all_medians else np.nan
     max_top1_share  = float(max(all_top1_shares)) if all_top1_shares else np.nan
     concentration_flag = int(not np.isnan(max_top1_share) and max_top1_share > CONCENTRATION_THRESHOLD)
+
+    # Target ladder pulled from the horizon this signal actually scores best
+    # at, not averaged across horizons -- a "80%-clear level" for a 5-day
+    # hold and a 20-day hold aren't the same kind of quantity, so blending
+    # them would produce a number that doesn't correspond to any real
+    # holding period. BestHorizon has already been selected by
+    # CompositeScore_{h}D, so these are "the target ladder for the horizon
+    # this signal is actually good at."
+    target1_conservative = result.get(f"MFE_Target_P20_{best_h}D")
+    target2_median        = result.get(f"MFE_Target_P50_{best_h}D")
+    target3_stretch        = result.get(f"MFE_Target_P80_{best_h}D")
 
     result.update({
         "AvgEV":                round(avg_ev, 6),
@@ -710,8 +838,12 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         "BestHorizon":          best_h,
         "BestHorizonComposite": best_h_composite,
         "AvgMedianReturn":      round(avg_median, 5) if not np.isnan(avg_median) else np.nan,
+        "AvgWinRate_HitEV":     round(avg_hitrate, 4) if not np.isnan(avg_hitrate) else np.nan,
         "MaxTop1TradeShare":    round(max_top1_share, 4) if not np.isnan(max_top1_share) else np.nan,
         "Concentration_Flag":   concentration_flag,
+        "Target1_Conservative_BestHorizon": target1_conservative,
+        "Target2_Median_BestHorizon":       target2_median,
+        "Target3_Stretch_BestHorizon":      target3_stretch,
     })
     return result
 
@@ -931,6 +1063,7 @@ def build_leaderboard(all_results: list) -> pd.DataFrame:
         Avg_Consistency     = ("Consistency",           "mean"),
         Avg_Count           = ("Count",                 "mean"),
         Avg_MedianReturn    = ("AvgMedianReturn",       "mean"),
+        Avg_WinRate_HitEV   = ("AvgWinRate_HitEV",      "mean"),
         Avg_Top1TradeShare  = ("MaxTop1TradeShare",     "mean"),
         Pct_Concentrated    = ("Concentration_Flag",    "mean"),
     ).reset_index()
