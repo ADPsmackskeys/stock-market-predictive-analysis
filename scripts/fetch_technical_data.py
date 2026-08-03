@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import random
 import argparse
 import numpy as np
 import pandas as pd
@@ -25,6 +27,19 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # unbroken run of real trading days.
 GAP_THRESHOLD_DAYS = 45
 
+# Broad-market benchmark used for excess-return (market-relative) scoring in
+# signal_scanner.py. Fetched and cached through the exact same update_ticker
+# pipeline as every other symbol (same corporate-action detection, same
+# zero-volume/gap handling) so its own Close series is trustworthy -- an
+# index doesn't need adjustment for splits/bonuses the way a stock does, but
+# it can still have data-vendor hiccups, and reusing the same pipeline is
+# simpler than maintaining a separate one. "NIFTY50" is used as the on-disk
+# symbol name/filename; INDEX_TICKER_MAP is how update_ticker resolves that
+# to the actual Yahoo Finance ticker ("^NSEI"), which doesn't take a ".NS"/
+# ".BO" suffix the way individual equities do.
+BENCHMARK_SYMBOL = "NIFTY50"
+INDEX_TICKER_MAP = {"NIFTY50": "^NSEI"}
+
 # How many percentage points of mismatch between an old cached Close and a
 # freshly re-fetched Close (for the *same* historical date) counts as
 # evidence that a split/bonus/rights issue has happened since the ticker was
@@ -42,6 +57,21 @@ ADJUSTMENT_TOLERANCE = 0.03
 # against on every run, purely to check whether they're still on the same
 # adjustment basis they were saved under.
 OVERLAP_CHECK_DAYS = 10
+
+# yfinance/curl failures for a single ticker are usually transient (DNS
+# resolver hiccups, a request timeout) rather than evidence the ticker itself
+# is bad -- especially when many *different* tickers fail with the same
+# "Could not resolve host" error in a tight burst, which points at the local
+# resolver/network being overwhelmed (e.g. by --clean forcing a full-history
+# fetch for every ticker across several parallel workers at once) rather than
+# anything wrong with those specific tickers. Retry a few times with backoff
+# before giving up and recording "no valid data".
+FETCH_RETRIES = 3
+FETCH_RETRY_BACKOFF_SECONDS = 5  # doubled on each subsequent attempt
+
+# Where the list of tickers that still failed after retries gets written at
+# the end of a run, so they can be re-run on their own with --tickers-file.
+FAILED_TICKERS_FILE = "failed_tickers.txt"
 
 # Start and end dates
 START_DATE = "2021-01-01"
@@ -170,7 +200,7 @@ def clean_raw(df):
     return df[df["Volume"] > 0].reset_index(drop=True)
 
 
-def _download(yf_ticker, start, end):
+def _download(yf_ticker, start, end, max_retries=FETCH_RETRIES):
     """Thin wrapper around yf.download that always requests split/dividend-
     adjusted prices and normalizes the result to RAW_COLS.
 
@@ -184,26 +214,50 @@ def _download(yf_ticker, start, end):
     (1:10 split + 1:1 bonus, ~20x, Apr 2024) would show a fake multi-hundred-
     percent single-day "return" on its record date, corrupting every
     indicator and forward-return window that touched it.
+
+    Retries on both exceptions and an empty result (see FETCH_RETRIES /
+    FETCH_RETRY_BACKOFF_SECONDS). yfinance swallows most per-ticker network
+    failures internally (DNS errors, timeouts) and just returns an empty
+    DataFrame rather than raising -- so an empty result here is ambiguous
+    between "this ticker genuinely has no data in this window" and "the
+    request failed transiently". A small random jitter is added on top of
+    the backoff so parallel worker processes retrying at once don't all
+    hammer the same DNS/endpoint in lockstep and reproduce the same burst
+    that caused the failure in the first place.
     """
-    fetched = yf.download(
-        yf_ticker,
-        start=start,
-        end=end,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
-    if fetched.empty:
-        return pd.DataFrame(columns=RAW_COLS)
-    if isinstance(fetched.columns, pd.MultiIndex):
-        fetched.columns = [c[0] for c in fetched.columns]
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        fetched[col] = pd.to_numeric(fetched[col], errors="coerce")
-    fetched = fetched.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-    if fetched.empty:
-        return pd.DataFrame(columns=RAW_COLS)
-    fetched = fetched.reset_index()
-    return clean_raw(fetched[RAW_COLS])
+    last_exc = None
+    for attempt in range(max_retries):
+        if attempt > 0:
+            backoff = FETCH_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            time.sleep(backoff + random.uniform(0, 1.5))
+        try:
+            fetched = yf.download(
+                yf_ticker,
+                start=start,
+                end=end,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+            )
+        except Exception as e:
+            last_exc = e
+            continue
+        if fetched.empty:
+            last_exc = None  # empty isn't an exception, but keep retrying
+            continue
+        if isinstance(fetched.columns, pd.MultiIndex):
+            fetched.columns = [c[0] for c in fetched.columns]
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            fetched[col] = pd.to_numeric(fetched[col], errors="coerce")
+        fetched = fetched.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if fetched.empty:
+            continue
+        fetched = fetched.reset_index()
+        return clean_raw(fetched[RAW_COLS])
+
+    if last_exc is not None:
+        raise last_exc
+    return pd.DataFrame(columns=RAW_COLS)
 
 
 def _detect_retroactive_adjustment(yf_ticker, old_df):
@@ -276,7 +330,9 @@ def update_ticker(ticker, force_clean=False):
             old_df = clean_raw(old_df)
             removed = orig_len - len(old_df)
 
-    yf_ticker = f"{ticker}.NS" if not ticker.endswith((".NS", ".BO")) else ticker
+    yf_ticker = INDEX_TICKER_MAP.get(ticker) or (
+        f"{ticker}.NS" if not ticker.endswith((".NS", ".BO")) else ticker
+    )
 
     try:
         rebuilt_for_adjustment = False
@@ -358,6 +414,11 @@ def update_ticker(ticker, force_clean=False):
         return ticker, None, str(e)
 
 
+def _load_tickers_file(path):
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fetch/update NSE technical data")
     parser.add_argument("--clean", action="store_true",
@@ -366,10 +427,37 @@ def main():
                               "corporate-action fix to catch splits/bonuses already baked into old caches")
     parser.add_argument("--workers", type=int, default=None,
                          help="Parallel worker processes (default: min(CPU count, 8), since this is a "
-                              "network-bound task and too many workers just hits Yahoo's rate limits)")
+                              "network-bound task and too many workers just hits Yahoo's rate limits -- "
+                              "if you're re-running a --tickers-file of failures from a previous run, "
+                              "pass a smaller number here too, e.g. --workers 3)")
     parser.add_argument("--ticker", type=str, default=None,
                          help="Update a single ticker only (skips parallelization)")
+    parser.add_argument("--tickers-file", type=str, default=None,
+                         help=f"Update only the tickers listed in this file (one per line) instead of "
+                              f"the full universe. A run that ends with failures writes its own list to "
+                              f"{FAILED_TICKERS_FILE!r}, so the one-command retry is: "
+                              f"python fetch_technical_data.py --clean --tickers-file {FAILED_TICKERS_FILE}")
+    parser.add_argument("--skip-benchmark", action="store_true",
+                         help=f"Skip updating the {BENCHMARK_SYMBOL} benchmark index. It's fetched by "
+                              f"default before the main ticker loop since signal_scanner.py's "
+                              f"market-relative benchmarking needs it -- skip only if you're just "
+                              f"re-running individual tickers and already have a current benchmark file")
     args = parser.parse_args()
+
+    tickers = TICKERS
+    if args.tickers_file:
+        tickers = _load_tickers_file(args.tickers_file)
+        print(f"Loaded {len(tickers)} tickers from {args.tickers_file}\n")
+
+    if not args.skip_benchmark and not args.ticker:
+        print(f"Updating benchmark index {BENCHMARK_SYMBOL} ({INDEX_TICKER_MAP[BENCHMARK_SYMBOL]})...")
+        _, bench_status, bench_err = update_ticker(BENCHMARK_SYMBOL, force_clean=args.clean)
+        if bench_err:
+            print(f"  [WARNING] {BENCHMARK_SYMBOL}: {bench_err} -- market-relative benchmarking in "
+                  f"signal_scanner.py will be unavailable until this succeeds")
+        else:
+            print(f"  {BENCHMARK_SYMBOL}: {bench_status}")
+        print()
 
     failed_tickers = []
 
@@ -382,11 +470,11 @@ def main():
         return
 
     n_workers = args.workers or min(os.cpu_count() or 1, 8)
-    print(f"Updating {len(TICKERS)} tickers across {n_workers} worker processes...\n")
+    print(f"Updating {len(tickers)} tickers across {n_workers} worker processes...\n")
 
     done = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {executor.submit(update_ticker, t, args.clean): t for t in TICKERS}
+        futures = {executor.submit(update_ticker, t, args.clean): t for t in tickers}
         for future in as_completed(futures):
             ticker = futures[future]
             done += 1
@@ -396,17 +484,34 @@ def main():
                 # Crash inside the worker process itself (not caught by the
                 # try/except in update_ticker) -- still record it and move on
                 # rather than letting one bad ticker kill the whole run.
-                print(f"[{done}/{len(TICKERS)}] {ticker}: WORKER CRASH: {e}")
+                print(f"[{done}/{len(tickers)}] {ticker}: WORKER CRASH: {e}")
                 failed_tickers.append(ticker)
                 continue
 
             if err:
-                print(f"[{done}/{len(TICKERS)}] {t}: ERROR: {err}")
+                print(f"[{done}/{len(tickers)}] {t}: ERROR: {err}")
+                failed_tickers.append(t)
+            elif status == "no valid data":
+                # After FETCH_RETRIES attempts this ticker still came back
+                # empty. Could be a genuinely delisted/invalid ticker, but
+                # given how these tend to arrive (bursts of DNS/timeout
+                # errors across many unrelated tickers at once), treat it as
+                # retry-worthy rather than silently dropping it -- a ticker
+                # that's really gone will just fail again on retry and cost
+                # one extra request, which is cheap insurance against losing
+                # real history to a network blip.
+                print(f"[{done}/{len(tickers)}] {t}: {status}")
                 failed_tickers.append(t)
             else:
-                print(f"[{done}/{len(TICKERS)}] {t}: {status}")
+                print(f"[{done}/{len(tickers)}] {t}: {status}")
 
     print("\nFailed Tickers:", failed_tickers)
+    if failed_tickers:
+        with open(FAILED_TICKERS_FILE, "w") as f:
+            f.write("\n".join(failed_tickers) + "\n")
+        print(f"\nWrote {len(failed_tickers)} failed tickers to {FAILED_TICKERS_FILE}")
+        print(f"Retry them in one command with:")
+        print(f"  python fetch_technical_data.py --clean --tickers-file {FAILED_TICKERS_FILE} --workers 3")
 
 
 if __name__ == "__main__":

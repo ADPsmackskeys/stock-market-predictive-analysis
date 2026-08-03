@@ -74,6 +74,13 @@ DATA_SUFFIX     = "_data.csv"
 OUTPUT_FOLDER   = "results/signals_v2"
 Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
 
+# Must match fetch_technical_data.py's BENCHMARK_SYMBOL -- this is the
+# on-disk symbol name for the market index used for excess-return (market-
+# relative) scoring, not a stock to be scanned for signals itself (see
+# load_benchmark_forward_returns and main()'s exclusion of it from the
+# universe glob).
+BENCHMARK_SYMBOL = "NIFTY50"
+
 # ── Horizon groups
 # Signals are assigned to one class. Each class has its own horizon list.
 # MFE is computed over the full window (not just close-at-N).
@@ -200,6 +207,30 @@ COMPUTE_FISHER  = True
 FISHER_ALPHA    = 0.10
 TEST_TRIPLES    = False
 VERBOSE         = True
+
+# A Bullish signal that stayed True (never once flipped False) all the way
+# through a stock's own worst historical decline hasn't actually been tested
+# by adversity -- it just happened to never need to protect anyone during the
+# one period that would have proven whether it does. Symmetrically for a
+# Bearish signal spanning the stock's best historical rally. This is the
+# QPOWER pattern generalized and automated: QPOWER's Golden_Cross_State
+# stayed True throughout its one real -44.3% correction, which is exactly
+# why its 25 top bullish signals all showed suspiciously uniform 86-97% win
+# rates -- the "edge" was really just the stock's own uninterrupted rally.
+# A decline/rally below this threshold isn't a meaningful test either way
+# (see compute_regime_windows) -- a stock with NO segment ever reaching this
+# is treated the same as a signal that failed the test: there's simply no
+# evidence it would survive real adversity, whichever reason.
+MIN_DRAWDOWN_FOR_REGIME_TEST = 0.15
+
+# Significance level for the Benjamini-Hochberg FDR correction applied
+# globally across every Fisher p-value computed in a single run (see
+# compute_bh_qvalues). Kept as a separate constant from FISHER_ALPHA: the
+# per-test Fisher_sig_flag column (uncorrected) is kept alongside the
+# corrected Fisher_q_value / FDR_sig_flag so the before/after of the
+# correction stays visible rather than silently replacing one with the
+# other.
+FDR_ALPHA = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ATOMIC SIGNAL DEFINITIONS
@@ -524,6 +555,46 @@ def get_horizon_class(signal_name: str) -> str:
 
 ALL_HORIZONS = sorted(set(h for g in HORIZON_GROUPS.values() for h in g["horizons"]))
 
+_BENCHMARK_FWD_CACHE: Optional[pd.DataFrame] = None
+_BENCHMARK_LOAD_ATTEMPTED = False
+
+
+def load_benchmark_forward_returns() -> Optional[pd.DataFrame]:
+    """Load the benchmark index's (see BENCHMARK_SYMBOL / fetch_technical_
+    data.py's INDEX_TICKER_MAP) own price history and precompute its forward
+    returns for every horizon, once per process. Returns a DataFrame indexed
+    by Date with Bench_Fwd_Close_{h}D columns, or None if the benchmark file
+    isn't available -- callers must treat None as "market-relative scoring
+    unavailable this run" and degrade gracefully (EV_Excess_{h}D etc. come
+    out NaN), not crash the whole scan over a missing benchmark file.
+
+    Cached at module level: call this once in main() before creating the
+    ProcessPoolExecutor so the cache is populated before fork and every
+    worker inherits it via copy-on-write, instead of each of potentially
+    thousands of worker calls re-reading the same small file from disk.
+    """
+    global _BENCHMARK_FWD_CACHE, _BENCHMARK_LOAD_ATTEMPTED
+    if _BENCHMARK_FWD_CACHE is not None or _BENCHMARK_LOAD_ATTEMPTED:
+        return _BENCHMARK_FWD_CACHE
+
+    _BENCHMARK_LOAD_ATTEMPTED = True
+    path = os.path.join(INPUT_FOLDER, f"{BENCHMARK_SYMBOL}{DATA_SUFFIX}")
+    if not os.path.exists(path):
+        return None
+    try:
+        bdf = pd.read_csv(path, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
+    except Exception:
+        return None
+    if bdf.empty or "Close" not in bdf.columns:
+        return None
+
+    for h in ALL_HORIZONS:
+        bdf[f"Bench_Fwd_Close_{h}D"] = bdf["Close"].shift(-h) / bdf["Close"] - 1
+
+    cols = ["Date"] + [f"Bench_Fwd_Close_{h}D" for h in ALL_HORIZONS]
+    _BENCHMARK_FWD_CACHE = bdf[cols]
+    return _BENCHMARK_FWD_CACHE
+
 
 def precompute_horizon_arrays(df: pd.DataFrame) -> Dict[int, Dict[str, np.ndarray]]:
     """Numpy arrays for every horizon, computed once per symbol instead of once
@@ -531,13 +602,18 @@ def precompute_horizon_arrays(df: pd.DataFrame) -> Dict[int, Dict[str, np.ndarra
     since the same MFE/close/threshold arrays were previously re-sliced out of
     the DataFrame (with pandas .loc/dropna overhead) for every single combo."""
     atr_pct = (df["ATR_14"] / df["Close"]).to_numpy()
+    n = len(df)
     arrays = {}
     for h in ALL_HORIZONS:
+        bench_col = f"Bench_Fwd_Close_{h}D"
         arrays[h] = {
             "mfe_bull":  df[f"MFE_Bull_{h}D"].to_numpy(),
             "mfe_bear":  df[f"MFE_Bear_{h}D"].to_numpy(),
             "fwd_close": df[f"Fwd_Close_{h}D"].to_numpy(),
             "min_move":  ATR_THRESHOLD_K * atr_pct * np.sqrt(h),
+            "bench_fwd_close": (
+                df[bench_col].to_numpy() if bench_col in df.columns else np.full(n, np.nan)
+            ),
         }
     return arrays
 
@@ -583,9 +659,111 @@ def get_episode_start_mask(mask_arr: np.ndarray) -> np.ndarray:
     return mask_arr & ~prev_true
 
 
+def _max_drawdown(close: np.ndarray) -> Tuple[int, int, float]:
+    """Standard single-worst-drawdown scan: the (peak_idx, trough_idx, pct)
+    with the largest peak-to-trough decline in `close`. pct is returned
+    positive (e.g. 0.443 for a -44.3% decline). Indices are local to the
+    `close` array passed in -- callers on a multi-segment DataFrame must
+    offset them back to global row positions themselves."""
+    n = close.size
+    if n < 2:
+        return 0, 0, 0.0
+    running_max = np.maximum.accumulate(close)
+    drawdown = (close - running_max) / running_max  # <= 0
+    trough_idx = int(np.argmin(drawdown))
+    peak_idx = int(np.argmax(close[: trough_idx + 1]))
+    pct = float(-drawdown[trough_idx])
+    return peak_idx, trough_idx, pct
+
+
+def _max_rally(close: np.ndarray) -> Tuple[int, int, float]:
+    """Mirror of _max_drawdown: the single largest trough-to-peak incline,
+    returned as (trough_idx, peak_idx, pct), pct positive."""
+    n = close.size
+    if n < 2:
+        return 0, 0, 0.0
+    running_min = np.minimum.accumulate(close)
+    rally = (close - running_min) / running_min  # >= 0
+    peak_idx = int(np.argmax(rally))
+    trough_idx = int(np.argmin(close[: peak_idx + 1]))
+    pct = float(rally[peak_idx])
+    return trough_idx, peak_idx, pct
+
+
+def compute_regime_windows(df: pd.DataFrame) -> Tuple[List[Tuple[int, int, float]], List[Tuple[int, int, float]]]:
+    """Per-segment worst-drawdown and best-rally windows, in GLOBAL row
+    index space (offset by each segment's starting position), filtered to
+    only those meeting MIN_DRAWDOWN_FOR_REGIME_TEST -- a smaller decline/
+    rally isn't a meaningful adversity test either way. Computed once per
+    symbol (segments don't depend on which signal is being evaluated) and
+    reused across every score_signal() call for that symbol.
+
+    Segment-scoped for the same reason indicators and forward windows are:
+    a long real trading gap (see fetch_technical_data.py) means the price
+    series on either side reflects unrelated regimes, so a "decline" that
+    spans the gap would be comparing prices that were never actually
+    continuous.
+    """
+    drawdown_windows: List[Tuple[int, int, float]] = []
+    rally_windows: List[Tuple[int, int, float]] = []
+
+    if "Segment" in df.columns:
+        seg_groups = [(seg_id, grp) for seg_id, grp in df.groupby("Segment", sort=True)]
+    else:
+        seg_groups = [(0, df)]
+
+    for _, grp in seg_groups:
+        if len(grp) < 2:
+            continue
+        offset = int(grp.index[0])
+        close = grp["Close"].to_numpy(dtype=float)
+
+        p_idx, t_idx, dd_pct = _max_drawdown(close)
+        if dd_pct >= MIN_DRAWDOWN_FOR_REGIME_TEST:
+            drawdown_windows.append((offset + p_idx, offset + t_idx, dd_pct))
+
+        t_idx2, p_idx2, r_pct = _max_rally(close)
+        if r_pct >= MIN_DRAWDOWN_FOR_REGIME_TEST:
+            rally_windows.append((offset + t_idx2, offset + p_idx2, r_pct))
+
+    return drawdown_windows, rally_windows
+
+
+def check_regime_tested(mask_arr: np.ndarray, direction: str,
+                         drawdown_windows: List[Tuple[int, int, float]],
+                         rally_windows: List[Tuple[int, int, float]]) -> int:
+    """1 if this signal has been through a real adversity test (or none was
+    available to fail), 0 if it's the QPOWER pattern: a Bullish signal that
+    was True for the ENTIRE span of at least one qualifying decline (never
+    flipped off to de-risk), or a Bearish signal True for the entire span of
+    at least one qualifying rally.
+
+    No qualifying window at all (stock never had a decline/rally reaching
+    MIN_DRAWDOWN_FOR_REGIME_TEST in any segment) also returns 0 -- that's
+    the short-history half of the QPOWER problem: there's no evidence either
+    way, which is treated the same as evidence of failure, not as a pass.
+
+    Event-type signals (single-day triggers) can't structurally span a
+    multi-day window, so this is a no-op pass for them by construction --
+    only persistent state-type signals (or combos containing one) can ever
+    fail this check, which is exactly the failure mode it targets.
+    """
+    windows = drawdown_windows if direction == "Bullish" else rally_windows
+    if not windows:
+        return 0
+    for start_idx, end_idx, _pct in windows:
+        if end_idx >= mask_arr.size:
+            continue
+        if mask_arr[start_idx: end_idx + 1].all():
+            return 0
+    return 1
+
+
 def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
                   horizon_arrays: Dict[int, Dict[str, np.ndarray]],
-                  class_valid_masks: Dict[str, np.ndarray]) -> Optional[dict]:
+                  class_valid_masks: Dict[str, np.ndarray],
+                  drawdown_windows: Optional[List[Tuple[int, int, float]]] = None,
+                  rally_windows: Optional[List[Tuple[int, int, float]]] = None) -> Optional[dict]:
     """
     Primary metrics (per horizon):
       WinRate_MFE  — % of occurrences where MFE exceeded the ATR-normalized threshold
@@ -664,6 +842,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
     result = {"Count": count, "HorizonClass": hclass, "Direction": direction}
     all_evs, all_srs, all_pfs, horizon_composites = [], [], [], []
     all_medians, all_top1_shares, all_hitrates = [], [], []
+    all_evs_excess = []
     mfe_key    = "mfe_bull" if direction == "Bullish" else "mfe_bear"
     multiplier = 1.0 if direction == "Bullish" else -1.0
 
@@ -750,6 +929,40 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         gross_profit = float(pos_wins.sum()) if pos_wins.size > 0 else 0.0
         top1_share = (float(pos_wins.max()) / gross_profit) if (gross_profit > 1e-9 and pos_wins.size > 0) else np.nan
 
+        # --- Market-relative (excess-return) EV: same MFE-based win/loss
+        # classification as everything else above, but the P&L is measured
+        # against the benchmark index's own return over the same window,
+        # not in absolute terms. For a Bullish signal this is
+        # (stock_return - index_return); for a Bearish signal it's
+        # (index_return - stock_return) -- i.e. "how much extra did shorting
+        # this beat shorting the index" -- which is exactly `rv - bench*
+        # multiplier` since rv is already signed by multiplier. This is what
+        # actually answers "is this stock-picking skill, or just NSE's broad
+        # 2021-2026 bull-market drift showing up as EV" -- raw AvgEV alone
+        # can't distinguish those, and that conflation was the original
+        # explanation offered for Bullish signals scoring 3-9x higher than
+        # Bearish ones across every horizon class. NaN (not 0) when the
+        # benchmark file isn't available or doesn't cover these dates --
+        # "unknown" is not the same as "no excess return".
+        bench_full = harr.get("bench_fwd_close")
+        bench_h = bench_full[valid_h] if bench_full is not None else np.full(rv.shape, np.nan)
+        excess_valid = ~np.isnan(bench_h)
+        excess_count = int(excess_valid.sum())
+        if excess_count >= 2:
+            rv_excess = rv[excess_valid] - bench_h[excess_valid] * multiplier
+            win_mask_excess = win_mask[excess_valid]
+            lo_e, hi_e = np.percentile(rv_excess, [WINSOR_PCTL, 100 - WINSOR_PCTL])
+            rv_excess_w = np.clip(rv_excess, lo_e, hi_e)
+            wins_e   = rv_excess_w[win_mask_excess]
+            losses_e = rv_excess_w[~win_mask_excess]
+            win_rate_e  = float(win_mask_excess.mean())
+            loss_rate_e = 1.0 - win_rate_e
+            avg_win_e   = float(wins_e.mean())   if wins_e.size   > 0 else 0.0
+            avg_loss_e  = float(losses_e.mean()) if losses_e.size > 0 else 0.0
+            ev_excess = win_rate_e * avg_win_e + loss_rate_e * avg_loss_e
+        else:
+            ev_excess = np.nan
+
         # --- Quantile-based (not mean-based) scale-out targets, from the
         # RAW mfe_vals distribution (best price reached within the window),
         # across ALL occurrences for this horizon -- wins and losses alike,
@@ -764,13 +977,13 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         # distortion that AvgWinRate_HitEV (~30-40% here) shows AvgEV
         # suffers from.
         #
-        # MFE_Target_P20_{h}D -- the level ~80% of occurrences reached
-        #   (100-20=80% of the distribution is at or above the 20th
+        # MFE_Target_P10_{h}D -- the level ~90% of occurrences reached
+        #   (100-10=90% of the distribution is at or above the 10th
         #   percentile) -- conservative, near, high-confidence target.
-        # MFE_Target_P50_{h}D -- the median -- ~50% of occurrences reached it.
-        # MFE_Target_P80_{h}D -- the level only ~20% of occurrences reached
+        # MFE_Target_P20_{h}D -- the level ~80% of occurrences reached it.
+        # MFE_Target_P30_{h}D -- the level ~70% of occurrences reached
         #   -- the stretch target.
-        p20, p50, p80 = np.percentile(mfe_vals, [20, 50, 80])
+        p10, p20, p30 = np.percentile(mfe_vals, [10, 20, 30])
 
         composite_h = round(ev * max(pf_for_composite, 1.0) * np.log1p(count), 6)
 
@@ -784,9 +997,11 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         result[f"WinRate_HitEV_{h}D"]      = round(winrate_hit_ev, 4)
         result[f"AvgMinMovePct_{h}D"]      = round(float(min_move_vals.mean()) * 100, 3)
         result[f"Top1_Trade_Share_{h}D"]   = round(top1_share, 4) if not np.isnan(top1_share) else np.nan
+        result[f"EV_Excess_{h}D"]          = round(ev_excess, 6) if not np.isnan(ev_excess) else np.nan
+        result[f"ExcessDataCount_{h}D"]    = excess_count
+        result[f"MFE_Target_P10_{h}D"]     = round(float(p10), 5)
         result[f"MFE_Target_P20_{h}D"]     = round(float(p20), 5)
-        result[f"MFE_Target_P50_{h}D"]     = round(float(p50), 5)
-        result[f"MFE_Target_P80_{h}D"]     = round(float(p80), 5)
+        result[f"MFE_Target_P30_{h}D"]     = round(float(p30), 5)
         result[f"CompositeScore_{h}D"]     = composite_h
 
         all_evs.append(ev)
@@ -794,6 +1009,8 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         all_pfs.append(pf_raw if not np.isnan(pf_raw) else 0.0)
         all_medians.append(median_return)
         all_hitrates.append(winrate_hit_ev)
+        if not np.isnan(ev_excess):
+            all_evs_excess.append(ev_excess)
         if not np.isnan(top1_share):
             all_top1_shares.append(top1_share)
         horizon_composites.append((h, composite_h))
@@ -825,9 +1042,23 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
     # holding period. BestHorizon has already been selected by
     # CompositeScore_{h}D, so these are "the target ladder for the horizon
     # this signal is actually good at."
-    target1_conservative = result.get(f"MFE_Target_P20_{best_h}D")
-    target2_median        = result.get(f"MFE_Target_P50_{best_h}D")
-    target3_stretch        = result.get(f"MFE_Target_P80_{best_h}D")
+    target1_conservative = result.get(f"MFE_Target_P10_{best_h}D")
+    target2_median        = result.get(f"MFE_Target_P20_{best_h}D")
+    target3_stretch        = result.get(f"MFE_Target_P30_{best_h}D")
+
+    regime_tested_flag = check_regime_tested(
+        mask_arr, direction,
+        drawdown_windows if drawdown_windows is not None else [],
+        rally_windows if rally_windows is not None else [],
+    )
+
+    # Mean of the per-horizon EV_Excess values that actually had benchmark
+    # coverage (see ExcessDataCount_{h}D) -- NaN, not 0, if no horizon had
+    # any (benchmark file unavailable or doesn't cover this stock's dates).
+    # Comparing this directly against AvgEV is the actual point: a large gap
+    # (high AvgEV, near-zero or negative AvgEV_Excess) means the apparent
+    # edge is market beta/drift, not stock-specific skill.
+    avg_ev_excess = float(np.mean(all_evs_excess)) if all_evs_excess else np.nan
 
     result.update({
         "AvgEV":                round(avg_ev, 6),
@@ -841,6 +1072,8 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         "AvgWinRate_HitEV":     round(avg_hitrate, 4) if not np.isnan(avg_hitrate) else np.nan,
         "MaxTop1TradeShare":    round(max_top1_share, 4) if not np.isnan(max_top1_share) else np.nan,
         "Concentration_Flag":   concentration_flag,
+        "RegimeTested_Flag":    regime_tested_flag,
+        "AvgEV_Excess":         round(avg_ev_excess, 6) if not np.isnan(avg_ev_excess) else np.nan,
         "Target1_Conservative_BestHorizon": target1_conservative,
         "Target2_Median_BestHorizon":       target2_median,
         "Target3_Stretch_BestHorizon":      target3_stretch,
@@ -912,7 +1145,10 @@ def build_combo_mask(signal_names, signal_map_np: Dict[str, np.ndarray]) -> np.n
 
 def run_symbol(filepath: str, test_triples: bool = False,
                exclude_concentrated: bool = True,
-               concentration_threshold: Optional[float] = None) -> Optional[pd.DataFrame]:
+               concentration_threshold: Optional[float] = None,
+               exclude_regime_untested: bool = True,
+               min_drawdown_for_regime_test: Optional[float] = None
+               ) -> Tuple[Optional[pd.DataFrame], np.ndarray]:
     """
     exclude_concentrated: when True (default), signals whose Concentration_Flag
     is set are dropped before the top-N-per-direction selection, so a single
@@ -923,37 +1159,74 @@ def run_symbol(filepath: str, test_triples: bool = False,
     concentration_threshold: overrides the module-level CONCENTRATION_THRESHOLD
     for this run's filtering decision only (does not change how
     MaxTop1TradeShare itself is computed).
+    exclude_regime_untested: when True (default), signals whose
+    RegimeTested_Flag is 0 (never had to survive the stock's own worst
+    decline/rally, or the stock never had one large enough to test) are
+    dropped from the ranking the same way -- see check_regime_tested.
+    min_drawdown_for_regime_test: overrides MIN_DRAWDOWN_FOR_REGIME_TEST for
+    this run only (does not change how the flag itself is computed if left
+    None -- it's threaded through to compute_regime_windows).
     """
     try:
         df = pd.read_csv(filepath, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
     except Exception as e:
         if VERBOSE: print(f"[SKIP] {filepath}: {e}")
-        return None
+        return None, np.array([], dtype=np.float64)
 
     if len(df) < 100:
         if VERBOSE: print(f"[SKIP] Too few rows ({len(df)}) in {filepath}")
-        return None
+        return None, np.array([], dtype=np.float64)
 
     symbol  = df["Symbol"].iloc[0]  if "Symbol"  in df.columns else Path(filepath).stem
     company = df["Company"].iloc[0] if "Company" in df.columns else ""
     if VERBOSE: print(f"  → {symbol} ({len(df)} rows)")
 
     df = add_forward_windows(df)
+
+    # Left-join the benchmark's own forward returns by Date, for excess-
+    # return (market-relative) scoring in score_signal. Left join, not
+    # inner: a date this stock traded but the benchmark file doesn't cover
+    # (e.g. it predates the benchmark fetch's own history) should still keep
+    # its raw-return row -- it just won't have excess-return data, which
+    # score_signal already handles as a NaN-gated subset, not a reason to
+    # drop the row entirely.
+    bench_fwd = load_benchmark_forward_returns()
+    if bench_fwd is not None:
+        df = df.merge(bench_fwd, on="Date", how="left")
     signal_map, direction_map = compute_all_signals(df)
 
     # Convert once per symbol: every combo evaluation below reuses these numpy
     # arrays directly instead of re-slicing the DataFrame (with pandas .loc /
     # dropna overhead) on every single call -- this was the actual bottleneck.
-    signal_map_np     = {name: series.to_numpy() for name, series in signal_map.items()}
+    # np.asarray (not .to_numpy()) because signal_map is a mix of pandas
+    # Series (atomic signals, via the _safe() wrapper) and raw numpy arrays
+    # (candlestick patterns from compute_candle_signals -- TA-Lib's
+    # functions return ndarrays, and boolean comparisons on them stay
+    # ndarrays, not Series). .to_numpy() would crash on the latter as soon
+    # as any candlestick pattern is present (see the same fix in
+    # live_signal_scan.py's get_current_signal_state).
+    signal_map_np     = {name: np.asarray(series, dtype=bool) for name, series in signal_map.items()}
     horizon_arrays     = precompute_horizon_arrays(df)
     class_valid_masks  = precompute_class_valid_masks(len(df))
+
+    # Also computed once per symbol -- doesn't depend on which signal is
+    # being evaluated, only on this stock's own price history.
+    if min_drawdown_for_regime_test is not None:
+        global MIN_DRAWDOWN_FOR_REGIME_TEST
+        _saved_threshold = MIN_DRAWDOWN_FOR_REGIME_TEST
+        MIN_DRAWDOWN_FOR_REGIME_TEST = min_drawdown_for_regime_test
+        drawdown_windows, rally_windows = compute_regime_windows(df)
+        MIN_DRAWDOWN_FOR_REGIME_TEST = _saved_threshold
+    else:
+        drawdown_windows, rally_windows = compute_regime_windows(df)
 
     bull_signals = [n for n, d in direction_map.items() if d == "Bullish"]
     bear_signals = [n for n, d in direction_map.items() if d == "Bearish"]
     rows = []
 
     def evaluate(name: str, signal_names: list, mask_arr: np.ndarray, direction: str):
-        metrics = score_signal(mask_arr, direction, name, horizon_arrays, class_valid_masks)
+        metrics = score_signal(mask_arr, direction, name, horizon_arrays, class_valid_masks,
+                                drawdown_windows=drawdown_windows, rally_windows=rally_windows)
         if metrics is None:
             return
         row = {
@@ -1013,7 +1286,7 @@ def run_symbol(filepath: str, test_triples: bool = False,
 
     if not rows:
         if VERBOSE: print(f"  [SKIP] No valid signals for {symbol}")
-        return None
+        return None, np.array([], dtype=np.float64)
 
     result_df = pd.DataFrame(rows)
     result_df["Symbol"]  = symbol
@@ -1030,20 +1303,40 @@ def run_symbol(filepath: str, test_triples: bool = False,
     else:
         rankable_df = result_df
 
+    if exclude_regime_untested:
+        untested = rankable_df["RegimeTested_Flag"].fillna(0) == 0
+        n_untested = int(untested.sum())
+        rankable_df = rankable_df[~untested].copy()
+        if VERBOSE and n_untested:
+            print(f"    ({n_untested} regime-untested signal(s) excluded from ranking for {symbol}, "
+                  f"never faced (or the stock never had) a decline/rally of "
+                  f"{(min_drawdown_for_regime_test if min_drawdown_for_regime_test is not None else MIN_DRAWDOWN_FOR_REGIME_TEST):.0%})")
+
     rankable_df = rankable_df.sort_values("CompositeScore", ascending=False)
 
     bull_top = rankable_df[rankable_df["Direction"] == "Bullish"].head(TOP_N_PER_DIR)
     bear_top = rankable_df[rankable_df["Direction"] == "Bearish"].head(TOP_N_PER_DIR)
     top_df   = pd.concat([bull_top, bear_top], ignore_index=True)
 
+    # Full (untruncated) set of Fisher p-values from every combo evaluated
+    # for this symbol -- not just the top-N that get saved -- so a global
+    # Benjamini-Hochberg correction (see compute_bh_qvalues / main()) can be
+    # computed against the actual full hypothesis universe that was tested,
+    # not a pre-filtered subset of it (using only top_df's p-values here
+    # would understate m and make the correction too lenient).
+    all_pvals = (
+        result_df["Fisher_p_min"].dropna().to_numpy(dtype=np.float64)
+        if "Fisher_p_min" in result_df.columns else np.array([], dtype=np.float64)
+    )
+
     if top_df.empty:
-        if VERBOSE: print(f"  [SKIP] No rankable signals for {symbol} after concentration filter")
-        return None
+        if VERBOSE: print(f"  [SKIP] No rankable signals for {symbol} after concentration/regime filters")
+        return None, all_pvals
 
     out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
     top_df.to_csv(out_path, index=False)
     if VERBOSE: print(f"  ✓ Saved {out_path}  ({len(top_df)} signals)")
-    return top_df
+    return top_df, all_pvals
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CROSS-SYMBOL LEADERBOARD
@@ -1066,15 +1359,73 @@ def build_leaderboard(all_results: list) -> pd.DataFrame:
         Avg_WinRate_HitEV   = ("AvgWinRate_HitEV",      "mean"),
         Avg_Top1TradeShare  = ("MaxTop1TradeShare",     "mean"),
         Pct_Concentrated    = ("Concentration_Flag",    "mean"),
+        Pct_RegimeTested    = ("RegimeTested_Flag",     "mean"),
+        Pct_FDR_Significant = ("FDR_sig_flag",          "mean") if "FDR_sig_flag" in combined.columns else ("Count", "size"),
     ).reset_index()
     agg["Prevalence_%"] = (agg["Symbol_Count"] / total_symbols * 100).round(1)
     agg["Pct_Concentrated"] = (agg["Pct_Concentrated"] * 100).round(1)
+    agg["Pct_RegimeTested"] = (agg["Pct_RegimeTested"] * 100).round(1)
+    if "FDR_sig_flag" in combined.columns:
+        agg["Pct_FDR_Significant"] = (agg["Pct_FDR_Significant"] * 100).round(1)
+    else:
+        agg = agg.drop(columns=["Pct_FDR_Significant"])
     agg = agg.sort_values("Avg_Composite", ascending=False)
 
     out_path = os.path.join(OUTPUT_FOLDER, "NSE_signal_leaderboard.csv")
     agg.to_csv(out_path, index=False)
     if VERBOSE: print(f"\n✓ Leaderboard → {out_path}")
     return agg
+
+
+def compute_bh_qvalues(pvals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Benjamini-Hochberg FDR correction over the FULL set of p-values from
+    one run (every Fisher_p_min computed across every symbol and every
+    signal/combo tested -- see run_symbol's all_pvals return value, NOT just
+    the top-N that get saved). Returns (p_sorted, q_sorted): p_sorted is
+    `pvals` sorted ascending, q_sorted is the corresponding BH-adjusted
+    q-value at each rank. Use bh_qvalue_lookup() to find a specific
+    original p-value's q-value in this pair of arrays.
+
+    This is deliberately global, not per-symbol: the original critique this
+    addresses was specifically "~3,240 tests per stock, across hundreds of
+    stocks -- eventually something will look amazing purely by chance," and
+    a per-symbol correction (m in the thousands) would badly understate the
+    real search size (m in the millions) that produced any given leaderboard
+    entry.
+
+    Standard step-up BH procedure:
+      1. p_(1) <= p_(2) <= ... <= p_(m), sorted ascending.
+      2. raw q_(i) = p_(i) * m / i
+      3. enforce monotonicity: q_(i) = min(q_(i), q_(i+1), ..., q_(m)) --
+         a running minimum from i=m down to i=1. This also handles ties
+         correctly with no special-casing: p-values that tie for the same
+         value naturally end up with the same final q-value after this pass.
+    """
+    p = np.asarray(pvals, dtype=np.float64)
+    p = p[~np.isnan(p)]
+    m = p.size
+    if m == 0:
+        return np.array([]), np.array([])
+    order = np.argsort(p, kind="mergesort")
+    p_sorted = p[order]
+    ranks = np.arange(1, m + 1, dtype=np.float64)
+    raw_q = p_sorted * m / ranks
+    q_sorted = np.minimum.accumulate(raw_q[::-1])[::-1]
+    q_sorted = np.clip(q_sorted, 0.0, 1.0)
+    return p_sorted, q_sorted
+
+
+def bh_qvalue_lookup(p_value: float, p_sorted: np.ndarray, q_sorted: np.ndarray) -> float:
+    """q-value for one original p-value, against the global (p_sorted,
+    q_sorted) pair from compute_bh_qvalues(). NaN in, NaN out. Ties (several
+    hypotheses sharing the exact same p-value) all resolve to the same
+    q-value by construction (see compute_bh_qvalues's monotonicity pass),
+    so any matching index works -- searchsorted's default ('left') is fine."""
+    if pd.isna(p_value) or p_sorted.size == 0:
+        return np.nan
+    idx = int(np.searchsorted(p_sorted, p_value, side="left"))
+    idx = min(idx, p_sorted.size - 1)
+    return float(q_sorted[idx])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
@@ -1085,17 +1436,20 @@ def _run_symbol_worker(args):
     ProcessPoolExecutor.submit (which needs a single positional-args tuple
     when the target isn't a plain top-level call with keyword args baked in
     at submit time)."""
-    filepath, test_triples, exclude_concentrated, concentration_threshold = args
+    (filepath, test_triples, exclude_concentrated, concentration_threshold,
+     exclude_regime_untested, min_drawdown_for_regime_test) = args
     return run_symbol(filepath, test_triples=test_triples,
                        exclude_concentrated=exclude_concentrated,
-                       concentration_threshold=concentration_threshold)
+                       concentration_threshold=concentration_threshold,
+                       exclude_regime_untested=exclude_regime_untested,
+                       min_drawdown_for_regime_test=min_drawdown_for_regime_test)
 
 
 def main():
     parser = argparse.ArgumentParser(description="NSE Signal Scanner v2")
     parser.add_argument("--symbol",    type=str, default=None, help="Single symbol only")
     parser.add_argument("--triples",   action="store_true",    help="Test triple combos (slow)")
-    parser.add_argument("--no-fisher", action="store_true",    help="Skip Fisher p-values")
+    parser.add_argument("--no-fisher", action="store_true",    help="Skip Fisher p-values (also disables FDR correction)")
     parser.add_argument("--workers",   type=int, default=None, help="Parallel worker processes (default: CPU count)")
     parser.add_argument("--max-concentration", type=float, default=None,
                          help=f"Override CONCENTRATION_THRESHOLD (default {CONCENTRATION_THRESHOLD}) "
@@ -1103,13 +1457,23 @@ def main():
     parser.add_argument("--keep-concentrated", action="store_true",
                          help="Do not exclude outlier-concentrated signals from the top-N ranking "
                               "(they still get MaxTop1TradeShare/Concentration_Flag columns either way)")
+    parser.add_argument("--min-drawdown", type=float, default=None,
+                         help=f"Override MIN_DRAWDOWN_FOR_REGIME_TEST (default {MIN_DRAWDOWN_FOR_REGIME_TEST}) "
+                              f"-- the decline/rally size that counts as a real adversity test")
+    parser.add_argument("--keep-regime-untested", action="store_true",
+                         help="Do not exclude regime-untested signals from the top-N ranking "
+                              "(they still get RegimeTested_Flag either way)")
+    parser.add_argument("--fdr-alpha", type=float, default=FDR_ALPHA,
+                         help=f"Benjamini-Hochberg FDR significance level (default {FDR_ALPHA}), "
+                              f"applied globally across every Fisher p-value computed in this run")
     args = parser.parse_args()
 
     global COMPUTE_FISHER
     if args.no_fisher:
         COMPUTE_FISHER = False
 
-    exclude_concentrated = not args.keep_concentrated
+    exclude_concentrated    = not args.keep_concentrated
+    exclude_regime_untested = not args.keep_regime_untested
 
     if args.symbol:
         fp = os.path.join(INPUT_FOLDER, f"{args.symbol}{DATA_SUFFIX}")
@@ -1118,37 +1482,94 @@ def main():
             return
         run_symbol(fp, test_triples=args.triples,
                    exclude_concentrated=exclude_concentrated,
-                   concentration_threshold=args.max_concentration)
+                   concentration_threshold=args.max_concentration,
+                   exclude_regime_untested=exclude_regime_untested,
+                   min_drawdown_for_regime_test=args.min_drawdown)
+        # Single-symbol runs skip the global FDR pass -- the whole point of
+        # a GLOBAL correction is the full cross-symbol hypothesis count, and
+        # correcting against just one symbol's ~3,240 tests, while still
+        # valid on its own terms, isn't what --fdr-alpha's docstring means
+        # by "globally across every ... test in this run". Fisher_sig_flag
+        # (uncorrected, per-test) is still populated as usual.
+        print("(Single-symbol run: Fisher_sig_flag is uncorrected. "
+              "Fisher_q_value/FDR_sig_flag are only computed on a full universe run.)")
         return
 
     files = sorted(glob.glob(os.path.join(INPUT_FOLDER, f"*{DATA_SUFFIX}")))
+    # Exclude the benchmark index file (see fetch_technical_data.py /
+    # load_benchmark_forward_returns) from the universe of "stocks to scan"
+    # -- it's not a tradeable signal target, it exists purely to provide
+    # excess-return data to every other symbol's scoring.
+    benchmark_path = os.path.join(INPUT_FOLDER, f"{BENCHMARK_SYMBOL}{DATA_SUFFIX}")
+    files = [f for f in files if os.path.abspath(f) != os.path.abspath(benchmark_path)]
     if not files:
         print(f"No files found in {INPUT_FOLDER}")
         return
+
+    # Load once here, before the pool is created, so the cache is populated
+    # in the parent process and every forked worker inherits it via
+    # copy-on-write rather than each of potentially thousands of worker
+    # calls re-reading the same small file from disk.
+    if load_benchmark_forward_returns() is None:
+        print(f"[WARNING] No {BENCHMARK_SYMBOL} benchmark data found at {benchmark_path} -- "
+              f"EV_Excess_{{h}}D / AvgEV_Excess will be NaN this run. "
+              f"Run fetch_technical_data.py first to fetch it.\n")
 
     n_workers = args.workers or os.cpu_count() or 1
     print(f"Processing {len(files)} symbols across {n_workers} worker processes...\n")
 
     all_results = []
+    all_pvals_list = []
     done = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        job_args = [(fp, args.triples, exclude_concentrated, args.max_concentration) for fp in files]
+        job_args = [(fp, args.triples, exclude_concentrated, args.max_concentration,
+                     exclude_regime_untested, args.min_drawdown) for fp in files]
         futures = {executor.submit(_run_symbol_worker, ja): ja[0] for ja in job_args}
         for future in as_completed(futures):
             fp = futures[future]
             done += 1
             try:
-                result = future.result()
+                top_df, pvals = future.result()
             except Exception as e:
                 print(f"[{done}/{len(files)}] [ERROR] {os.path.basename(fp)}: {e}")
                 continue
-            if result is not None:
-                all_results.append(result)
+            if top_df is not None:
+                all_results.append(top_df)
+            if pvals is not None and pvals.size:
+                all_pvals_list.append(pvals)
             if done % 25 == 0 or done == len(files):
                 print(f"[{done}/{len(files)}] processed")
 
+    if not all_results:
+        print("\nNo results to build a leaderboard from.")
+        return
+
+    combined = pd.concat(all_results, ignore_index=True)
+
+    if COMPUTE_FISHER and all_pvals_list:
+        all_pvals = np.concatenate(all_pvals_list)
+        p_sorted, q_sorted = compute_bh_qvalues(all_pvals)
+        m = p_sorted.size
+        print(f"\nApplying Benjamini-Hochberg FDR correction across {m:,} total hypotheses tested "
+              f"(alpha={args.fdr_alpha})...")
+        combined["Fisher_q_value"] = combined["Fisher_p_min"].apply(
+            lambda p: bh_qvalue_lookup(p, p_sorted, q_sorted)
+        )
+        combined["FDR_sig_flag"] = (combined["Fisher_q_value"] <= args.fdr_alpha).astype(int)
+        n_uncorrected_sig = int(combined["Fisher_sig_flag"].sum())
+        n_corrected_sig   = int(combined["FDR_sig_flag"].sum())
+        print(f"  {n_uncorrected_sig} signals were 'significant' at the uncorrected per-test level; "
+              f"{n_corrected_sig} remain significant after the global FDR correction.")
+
+        # Re-write each symbol's saved CSV with the corrected columns, so the
+        # per-symbol files and the leaderboard stay consistent with each
+        # other instead of only the leaderboard reflecting the correction.
+        for symbol, grp in combined.groupby("Symbol"):
+            out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
+            grp.to_csv(out_path, index=False)
+
     print(f"\nBuilding leaderboard from {len(all_results)} symbols...")
-    lb = build_leaderboard(all_results)
+    lb = build_leaderboard([combined])
     if not lb.empty:
         print("\n── Top 15 Universal Bull Signals ──")
         print(lb[lb["Direction"] == "Bullish"].head(15).to_string(index=False))
