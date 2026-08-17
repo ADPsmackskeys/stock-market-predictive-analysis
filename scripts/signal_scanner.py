@@ -223,15 +223,6 @@ VERBOSE         = True
 # evidence it would survive real adversity, whichever reason.
 MIN_DRAWDOWN_FOR_REGIME_TEST = 0.15
 
-# Significance level for the Benjamini-Hochberg FDR correction applied
-# globally across every Fisher p-value computed in a single run (see
-# compute_bh_qvalues). Kept as a separate constant from FISHER_ALPHA: the
-# per-test Fisher_sig_flag column (uncorrected) is kept alongside the
-# corrected Fisher_q_value / FDR_sig_flag so the before/after of the
-# correction stays visible rather than silently replacing one with the
-# other.
-FDR_ALPHA = 0.10
-
 # ─────────────────────────────────────────────────────────────────────────────
 # ATOMIC SIGNAL DEFINITIONS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1148,7 +1139,7 @@ def run_symbol(filepath: str, test_triples: bool = False,
                concentration_threshold: Optional[float] = None,
                exclude_regime_untested: bool = True,
                min_drawdown_for_regime_test: Optional[float] = None
-               ) -> Tuple[Optional[pd.DataFrame], np.ndarray]:
+               ) -> Optional[pd.DataFrame]:
     """
     exclude_concentrated: when True (default), signals whose Concentration_Flag
     is set are dropped before the top-N-per-direction selection, so a single
@@ -1171,11 +1162,11 @@ def run_symbol(filepath: str, test_triples: bool = False,
         df = pd.read_csv(filepath, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
     except Exception as e:
         if VERBOSE: print(f"[SKIP] {filepath}: {e}")
-        return None, np.array([], dtype=np.float64)
+        return None
 
     if len(df) < 100:
         if VERBOSE: print(f"[SKIP] Too few rows ({len(df)}) in {filepath}")
-        return None, np.array([], dtype=np.float64)
+        return None
 
     symbol  = df["Symbol"].iloc[0]  if "Symbol"  in df.columns else Path(filepath).stem
     company = df["Company"].iloc[0] if "Company" in df.columns else ""
@@ -1318,25 +1309,14 @@ def run_symbol(filepath: str, test_triples: bool = False,
     bear_top = rankable_df[rankable_df["Direction"] == "Bearish"].head(TOP_N_PER_DIR)
     top_df   = pd.concat([bull_top, bear_top], ignore_index=True)
 
-    # Full (untruncated) set of Fisher p-values from every combo evaluated
-    # for this symbol -- not just the top-N that get saved -- so a global
-    # Benjamini-Hochberg correction (see compute_bh_qvalues / main()) can be
-    # computed against the actual full hypothesis universe that was tested,
-    # not a pre-filtered subset of it (using only top_df's p-values here
-    # would understate m and make the correction too lenient).
-    all_pvals = (
-        result_df["Fisher_p_min"].dropna().to_numpy(dtype=np.float64)
-        if "Fisher_p_min" in result_df.columns else np.array([], dtype=np.float64)
-    )
-
     if top_df.empty:
         if VERBOSE: print(f"  [SKIP] No rankable signals for {symbol} after concentration/regime filters")
-        return None, all_pvals
+        return None
 
     out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
     top_df.to_csv(out_path, index=False)
     if VERBOSE: print(f"  ✓ Saved {out_path}  ({len(top_df)} signals)")
-    return top_df, all_pvals
+    return top_df
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CROSS-SYMBOL LEADERBOARD
@@ -1360,15 +1340,10 @@ def build_leaderboard(all_results: list) -> pd.DataFrame:
         Avg_Top1TradeShare  = ("MaxTop1TradeShare",     "mean"),
         Pct_Concentrated    = ("Concentration_Flag",    "mean"),
         Pct_RegimeTested    = ("RegimeTested_Flag",     "mean"),
-        Pct_FDR_Significant = ("FDR_sig_flag",          "mean") if "FDR_sig_flag" in combined.columns else ("Count", "size"),
     ).reset_index()
     agg["Prevalence_%"] = (agg["Symbol_Count"] / total_symbols * 100).round(1)
     agg["Pct_Concentrated"] = (agg["Pct_Concentrated"] * 100).round(1)
     agg["Pct_RegimeTested"] = (agg["Pct_RegimeTested"] * 100).round(1)
-    if "FDR_sig_flag" in combined.columns:
-        agg["Pct_FDR_Significant"] = (agg["Pct_FDR_Significant"] * 100).round(1)
-    else:
-        agg = agg.drop(columns=["Pct_FDR_Significant"])
     agg = agg.sort_values("Avg_Composite", ascending=False)
 
     out_path = os.path.join(OUTPUT_FOLDER, "NSE_signal_leaderboard.csv")
@@ -1376,56 +1351,6 @@ def build_leaderboard(all_results: list) -> pd.DataFrame:
     if VERBOSE: print(f"\n✓ Leaderboard → {out_path}")
     return agg
 
-
-def compute_bh_qvalues(pvals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Benjamini-Hochberg FDR correction over the FULL set of p-values from
-    one run (every Fisher_p_min computed across every symbol and every
-    signal/combo tested -- see run_symbol's all_pvals return value, NOT just
-    the top-N that get saved). Returns (p_sorted, q_sorted): p_sorted is
-    `pvals` sorted ascending, q_sorted is the corresponding BH-adjusted
-    q-value at each rank. Use bh_qvalue_lookup() to find a specific
-    original p-value's q-value in this pair of arrays.
-
-    This is deliberately global, not per-symbol: the original critique this
-    addresses was specifically "~3,240 tests per stock, across hundreds of
-    stocks -- eventually something will look amazing purely by chance," and
-    a per-symbol correction (m in the thousands) would badly understate the
-    real search size (m in the millions) that produced any given leaderboard
-    entry.
-
-    Standard step-up BH procedure:
-      1. p_(1) <= p_(2) <= ... <= p_(m), sorted ascending.
-      2. raw q_(i) = p_(i) * m / i
-      3. enforce monotonicity: q_(i) = min(q_(i), q_(i+1), ..., q_(m)) --
-         a running minimum from i=m down to i=1. This also handles ties
-         correctly with no special-casing: p-values that tie for the same
-         value naturally end up with the same final q-value after this pass.
-    """
-    p = np.asarray(pvals, dtype=np.float64)
-    p = p[~np.isnan(p)]
-    m = p.size
-    if m == 0:
-        return np.array([]), np.array([])
-    order = np.argsort(p, kind="mergesort")
-    p_sorted = p[order]
-    ranks = np.arange(1, m + 1, dtype=np.float64)
-    raw_q = p_sorted * m / ranks
-    q_sorted = np.minimum.accumulate(raw_q[::-1])[::-1]
-    q_sorted = np.clip(q_sorted, 0.0, 1.0)
-    return p_sorted, q_sorted
-
-
-def bh_qvalue_lookup(p_value: float, p_sorted: np.ndarray, q_sorted: np.ndarray) -> float:
-    """q-value for one original p-value, against the global (p_sorted,
-    q_sorted) pair from compute_bh_qvalues(). NaN in, NaN out. Ties (several
-    hypotheses sharing the exact same p-value) all resolve to the same
-    q-value by construction (see compute_bh_qvalues's monotonicity pass),
-    so any matching index works -- searchsorted's default ('left') is fine."""
-    if pd.isna(p_value) or p_sorted.size == 0:
-        return np.nan
-    idx = int(np.searchsorted(p_sorted, p_value, side="left"))
-    idx = min(idx, p_sorted.size - 1)
-    return float(q_sorted[idx])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
@@ -1449,7 +1374,7 @@ def main():
     parser = argparse.ArgumentParser(description="NSE Signal Scanner v2")
     parser.add_argument("--symbol",    type=str, default=None, help="Single symbol only")
     parser.add_argument("--triples",   action="store_true",    help="Test triple combos (slow)")
-    parser.add_argument("--no-fisher", action="store_true",    help="Skip Fisher p-values (also disables FDR correction)")
+    parser.add_argument("--no-fisher", action="store_true",    help="Skip Fisher p-values")
     parser.add_argument("--workers",   type=int, default=None, help="Parallel worker processes (default: CPU count)")
     parser.add_argument("--max-concentration", type=float, default=None,
                          help=f"Override CONCENTRATION_THRESHOLD (default {CONCENTRATION_THRESHOLD}) "
@@ -1463,9 +1388,6 @@ def main():
     parser.add_argument("--keep-regime-untested", action="store_true",
                          help="Do not exclude regime-untested signals from the top-N ranking "
                               "(they still get RegimeTested_Flag either way)")
-    parser.add_argument("--fdr-alpha", type=float, default=FDR_ALPHA,
-                         help=f"Benjamini-Hochberg FDR significance level (default {FDR_ALPHA}), "
-                              f"applied globally across every Fisher p-value computed in this run")
     args = parser.parse_args()
 
     global COMPUTE_FISHER
@@ -1485,14 +1407,6 @@ def main():
                    concentration_threshold=args.max_concentration,
                    exclude_regime_untested=exclude_regime_untested,
                    min_drawdown_for_regime_test=args.min_drawdown)
-        # Single-symbol runs skip the global FDR pass -- the whole point of
-        # a GLOBAL correction is the full cross-symbol hypothesis count, and
-        # correcting against just one symbol's ~3,240 tests, while still
-        # valid on its own terms, isn't what --fdr-alpha's docstring means
-        # by "globally across every ... test in this run". Fisher_sig_flag
-        # (uncorrected, per-test) is still populated as usual.
-        print("(Single-symbol run: Fisher_sig_flag is uncorrected. "
-              "Fisher_q_value/FDR_sig_flag are only computed on a full universe run.)")
         return
 
     files = sorted(glob.glob(os.path.join(INPUT_FOLDER, f"*{DATA_SUFFIX}")))
@@ -1519,7 +1433,6 @@ def main():
     print(f"Processing {len(files)} symbols across {n_workers} worker processes...\n")
 
     all_results = []
-    all_pvals_list = []
     done = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         job_args = [(fp, args.triples, exclude_concentrated, args.max_concentration,
@@ -1529,14 +1442,12 @@ def main():
             fp = futures[future]
             done += 1
             try:
-                top_df, pvals = future.result()
+                top_df = future.result()
             except Exception as e:
                 print(f"[{done}/{len(files)}] [ERROR] {os.path.basename(fp)}: {e}")
                 continue
             if top_df is not None:
                 all_results.append(top_df)
-            if pvals is not None and pvals.size:
-                all_pvals_list.append(pvals)
             if done % 25 == 0 or done == len(files):
                 print(f"[{done}/{len(files)}] processed")
 
@@ -1545,28 +1456,6 @@ def main():
         return
 
     combined = pd.concat(all_results, ignore_index=True)
-
-    if COMPUTE_FISHER and all_pvals_list:
-        all_pvals = np.concatenate(all_pvals_list)
-        p_sorted, q_sorted = compute_bh_qvalues(all_pvals)
-        m = p_sorted.size
-        print(f"\nApplying Benjamini-Hochberg FDR correction across {m:,} total hypotheses tested "
-              f"(alpha={args.fdr_alpha})...")
-        combined["Fisher_q_value"] = combined["Fisher_p_min"].apply(
-            lambda p: bh_qvalue_lookup(p, p_sorted, q_sorted)
-        )
-        combined["FDR_sig_flag"] = (combined["Fisher_q_value"] <= args.fdr_alpha).astype(int)
-        n_uncorrected_sig = int(combined["Fisher_sig_flag"].sum())
-        n_corrected_sig   = int(combined["FDR_sig_flag"].sum())
-        print(f"  {n_uncorrected_sig} signals were 'significant' at the uncorrected per-test level; "
-              f"{n_corrected_sig} remain significant after the global FDR correction.")
-
-        # Re-write each symbol's saved CSV with the corrected columns, so the
-        # per-symbol files and the leaderboard stay consistent with each
-        # other instead of only the leaderboard reflecting the correction.
-        for symbol, grp in combined.groupby("Symbol"):
-            out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
-            grp.to_csv(out_path, index=False)
 
     print(f"\nBuilding leaderboard from {len(all_results)} symbols...")
     lb = build_leaderboard([combined])
