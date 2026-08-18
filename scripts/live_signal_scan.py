@@ -39,6 +39,10 @@ Columns added beyond what signal_scanner.py stores per signal:
     Target3 far/stretch. Unlike AvgEV-based targets, these are quantiles,
     not means, so a single outlier historical occurrence can't drag them
     around the way it can drag AvgEV.
+  - SignalSinceDate (console output only, not saved to OUTPUT_FILE): the
+    date this signal's episode actually started (see get_since_date), not
+    the date it was scanned. Printed as the "Date" column so the console
+    report reads as "this has been active since X", not "as of today".
 
 Usage:
     python scripts/live_signal_scan.py
@@ -60,17 +64,29 @@ import signal_scanner as ss
 OUTPUT_FILE = "results/current_signals.csv"
 
 
-def get_current_signal_state(df: pd.DataFrame) -> dict:
-    """Boolean value of every atomic/candle signal on the most recent row.
+def get_since_date(components: list, signal_map: dict, dates: pd.Series):
+    """The date the currently-active episode of this signal (AND of all its
+    components) actually started -- i.e. the most recent date before which
+    at least one component was False, walking back from today. Not "today",
+    which is when live_signal_scan.py happened to notice it, but when it
+    first became true.
 
-    Values in signal_map are a mix of pandas Series (atomic signals, via the
-    _safe() wrapper in signal_scanner.py) and raw numpy arrays (candlestick
-    patterns from compute_candle_signals, since TA-Lib's functions return
-    ndarrays and boolean comparisons on them stay ndarrays, not Series).
-    np.asarray(...)[-1] handles both uniformly instead of assuming .iloc
-    exists."""
-    signal_map, _ = ss.compute_all_signals(df)
-    return {name: bool(np.asarray(series)[-1]) for name, series in signal_map.items()}
+    NaT if a component is missing from signal_map or the combined signal
+    isn't actually True on the last row -- callers only invoke this after
+    the current-state check has already passed, so that's a defensive
+    fallback, not the expected path."""
+    n = len(dates)
+    combined = np.ones(n, dtype=bool)
+    for c in components:
+        arr = signal_map.get(c)
+        if arr is None:
+            return pd.NaT
+        combined &= np.asarray(arr, dtype=bool)
+    if n == 0 or not combined[-1]:
+        return pd.NaT
+    false_positions = np.flatnonzero(~combined)
+    start_idx = int(false_positions[-1]) + 1 if false_positions.size else 0
+    return dates.iloc[start_idx]
 
 
 def get_current_atr_pct(df: pd.DataFrame) -> float:
@@ -101,7 +117,15 @@ def scan_symbol(tech_path: str, signals_path: str) -> list:
     if scored.empty:
         return []
 
-    current_state = get_current_signal_state(df)
+    # Values in signal_map are a mix of pandas Series (atomic signals, via
+    # the _safe() wrapper in signal_scanner.py) and raw numpy arrays
+    # (candlestick patterns from compute_candle_signals, since TA-Lib's
+    # functions return ndarrays and boolean comparisons on them stay
+    # ndarrays, not Series). np.asarray(...) handles both uniformly instead
+    # of assuming .iloc exists. Kept as full arrays (not just the last row)
+    # so get_since_date can walk back through history below.
+    signal_map, _ = ss.compute_all_signals(df)
+    current_state = {name: bool(np.asarray(series)[-1]) for name, series in signal_map.items()}
     last_date, last_close = df["Date"].iloc[-1], df["Close"].iloc[-1]
     atr_pct_now = get_current_atr_pct(df)
 
@@ -111,6 +135,7 @@ def scan_symbol(tech_path: str, signals_path: str) -> list:
         if not components or not all(current_state.get(c, False) for c in components):
             continue
 
+        since_date = get_since_date(components, signal_map, df["Date"])
         avg_ev = row["AvgEV"]
         if not pd.isna(atr_pct_now) and atr_pct_now > 1e-9 and not pd.isna(avg_ev):
             atr_adjusted_ev = round(float(avg_ev) / atr_pct_now, 3)
@@ -134,6 +159,7 @@ def scan_symbol(tech_path: str, signals_path: str) -> list:
         hits.append({
             "Symbol":            row["Symbol"],
             "Date":              last_date,
+            "SignalSinceDate":   since_date,
             "Close":             last_close,
             "SignalName":        row["SignalName"],
             "Direction":         row["Direction"],
@@ -223,15 +249,20 @@ def main():
 
     hits_df = hits_df.sort_values("CompositeScore", ascending=False)
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    hits_df.to_csv(OUTPUT_FILE, index=False)
+    # SignalSinceDate is a console-only column (see get_since_date) -- the
+    # saved CSV keeps exactly the same schema it always has.
+    csv_cols = [c for c in hits_df.columns if c != "SignalSinceDate"]
+    hits_df[csv_cols].to_csv(OUTPUT_FILE, index=False)
     as_of = hits_df["Date"].max()
     print(f"\n{len(hits_df)} currently-active validated signals (as of {as_of.date()}) -> {OUTPUT_FILE}")
 
-    cols = ["Symbol", "SignalName", "HorizonClass", "Count", "CompositeScore",
-            "AvgEV", "ATR_Adjusted_EV", "AvgWinRate", "AvgWinRate_HitEV",
+    cols = ["Symbol", "Date", "SignalName", "HorizonClass", "Count", "CompositeScore",
             "Close", "Target1_Price", "Target2_Price", "Target3_Price", "BestHorizon"]
     for direction in ["Bullish", "Bearish"]:
-        sub = hits_df[hits_df["Direction"] == direction].head(args.top)
+        sub = hits_df[hits_df["Direction"] == direction].head(args.top).copy()
+        # Display-only: show when the signal's episode actually started,
+        # not today's scan date (which is the same for every row).
+        sub["Date"] = sub["SignalSinceDate"].dt.date
         print(f"\n── Top {len(sub)} Active {direction} Signals ──")
         print(sub[cols].to_string(index=False))
 
