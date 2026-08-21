@@ -29,20 +29,33 @@ Columns added beyond what signal_scanner.py stores per signal:
     MFE-threshold-based). A low AvgWinRate_HitEV next to a high AvgWinRate
     is a tell that AvgEV is being carried by a few big occurrences rather
     than being a typical outcome.
+  - SignalSinceDate / SignalClose: the date this signal's episode actually
+    started (see get_since_index) and that day's Close -- not the date it
+    was scanned. In the console report SignalSinceDate is printed as the
+    "Date" column, so it reads as "this has been active since X", not "as
+    of today".
   - Target1_Price / Target2_Price / Target3_Price: signal_scanner.py's
     Target1_Conservative_BestHorizon / Target2_Median_BestHorizon /
     Target3_Stretch_BestHorizon are historical MFE-quantile *returns*
     (~80% / ~50% / ~20% historical clear rates respectively, at the
     horizon this signal scores best at) -- this script converts them into
-    actual price levels using *today's* Close, so they're directly usable
-    as a scale-out ladder: Target1 near/high-confidence, Target2 mid,
-    Target3 far/stretch. Unlike AvgEV-based targets, these are quantiles,
-    not means, so a single outlier historical occurrence can't drag them
-    around the way it can drag AvgEV.
-  - SignalSinceDate (console output only, not saved to OUTPUT_FILE): the
-    date this signal's episode actually started (see get_since_date), not
-    the date it was scanned. Printed as the "Date" column so the console
-    report reads as "this has been active since X", not "as of today".
+    actual price levels, so they're directly usable as a scale-out ladder:
+    Target1 near/high-confidence, Target2 mid, Target3 far/stretch. Unlike
+    AvgEV-based targets, these are quantiles, not means, so a single
+    outlier historical occurrence can't drag them around the way it can
+    drag AvgEV.
+
+    They are anchored to SignalClose -- the Close on the day the signal
+    first became true -- NOT to today's Close. The underlying quantiles are
+    measured from the close of the bar the signal fired on, so the entry
+    they describe is that bar's close; anchoring them to today's price
+    would silently re-base the whole ladder every day a persistent signal
+    stayed active, drifting the targets up with the price the signal was
+    supposed to be predicting and making an already-half-captured move look
+    like it still has the full historical run ahead of it. With the anchor
+    fixed at the firing bar, comparing Close against Target1_Price is a
+    real progress check: a signal several days old may already be past its
+    own first target.
 
 Usage:
     python scripts/live_signal_scan.py
@@ -64,29 +77,31 @@ import signal_scanner as ss
 OUTPUT_FILE = "results/current_signals.csv"
 
 
-def get_since_date(components: list, signal_map: dict, dates: pd.Series):
-    """The date the currently-active episode of this signal (AND of all its
-    components) actually started -- i.e. the most recent date before which
-    at least one component was False, walking back from today. Not "today",
-    which is when live_signal_scan.py happened to notice it, but when it
-    first became true.
+def get_since_index(components: list, signal_map: dict, n_rows: int):
+    """Row position at which the currently-active episode of this signal (AND
+    of all its components) actually started -- i.e. the first row after the
+    most recent row on which at least one component was False, walking back
+    from today. Not "today", which is when live_signal_scan.py happened to
+    notice it, but when it first became true.
 
-    NaT if a component is missing from signal_map or the combined signal
+    Returned as a row position rather than a date because callers need two
+    things off that row: the date (for reporting) and the Close (which is
+    what the target ladder is anchored to -- see scan_symbol).
+
+    None if a component is missing from signal_map or the combined signal
     isn't actually True on the last row -- callers only invoke this after
     the current-state check has already passed, so that's a defensive
     fallback, not the expected path."""
-    n = len(dates)
-    combined = np.ones(n, dtype=bool)
+    combined = np.ones(n_rows, dtype=bool)
     for c in components:
         arr = signal_map.get(c)
         if arr is None:
-            return pd.NaT
+            return None
         combined &= np.asarray(arr, dtype=bool)
-    if n == 0 or not combined[-1]:
-        return pd.NaT
+    if n_rows == 0 or not combined[-1]:
+        return None
     false_positions = np.flatnonzero(~combined)
-    start_idx = int(false_positions[-1]) + 1 if false_positions.size else 0
-    return dates.iloc[start_idx]
+    return int(false_positions[-1]) + 1 if false_positions.size else 0
 
 
 def get_current_atr_pct(df: pd.DataFrame) -> float:
@@ -123,7 +138,7 @@ def scan_symbol(tech_path: str, signals_path: str) -> list:
     # functions return ndarrays and boolean comparisons on them stay
     # ndarrays, not Series). np.asarray(...) handles both uniformly instead
     # of assuming .iloc exists. Kept as full arrays (not just the last row)
-    # so get_since_date can walk back through history below.
+    # so get_since_index can walk back through history below.
     signal_map, _ = ss.compute_all_signals(df)
     current_state = {name: bool(np.asarray(series)[-1]) for name, series in signal_map.items()}
     last_date, last_close = df["Date"].iloc[-1], df["Close"].iloc[-1]
@@ -135,7 +150,20 @@ def scan_symbol(tech_path: str, signals_path: str) -> list:
         if not components or not all(current_state.get(c, False) for c in components):
             continue
 
-        since_date = get_since_date(components, signal_map, df["Date"])
+        # The bar this signal actually fired on -- both the date to report it
+        # under and, more importantly, the Close the target ladder is anchored
+        # to (see module docstring).
+        since_idx = get_since_index(components, signal_map, len(df))
+        if since_idx is None:
+            # Defensive only: the current-state check above has already passed,
+            # so the combined signal is true on the last row by construction.
+            # Fall back to today's bar rather than dropping an otherwise-valid
+            # hit, and leave the date empty so the fallback is visible.
+            since_date, signal_close = pd.NaT, last_close
+        else:
+            since_date = df["Date"].iloc[since_idx]
+            signal_close = df["Close"].iloc[since_idx]
+
         avg_ev = row["AvgEV"]
         if not pd.isna(atr_pct_now) and atr_pct_now > 1e-9 and not pd.isna(avg_ev):
             atr_adjusted_ev = round(float(avg_ev) / atr_pct_now, 3)
@@ -143,14 +171,19 @@ def scan_symbol(tech_path: str, signals_path: str) -> list:
             atr_adjusted_ev = np.nan
 
         # Convert the historical MFE-quantile target *returns* (from the
-        # horizon this signal scores best at) into actual price levels using
-        # today's Close. NaN-safe: a signal can legitimately have no target
-        # columns if it predates this fix's per-symbol re-run.
+        # horizon this signal scores best at) into actual price levels off
+        # signal_close -- the Close of the bar the signal fired on, which is
+        # the same reference point those quantiles were measured from in
+        # signal_scanner.py (MFE_Bull/Bear_{h}D are both ratios against that
+        # day's Close). Using today's Close instead would re-anchor the ladder
+        # every day a persistent signal stayed true. NaN-safe: a signal can
+        # legitimately have no target columns if it predates this fix's
+        # per-symbol re-run.
         def _target_price(col):
             val = row.get(col, np.nan)
-            if pd.isna(val) or pd.isna(last_close):
+            if pd.isna(val) or pd.isna(signal_close):
                 return np.nan
-            return round(float(last_close) * (1.0 + float(val)), 2)
+            return round(float(signal_close) * (1.0 + float(val)), 2)
 
         target1_price = _target_price("Target1_Conservative_BestHorizon")
         target2_price = _target_price("Target2_Median_BestHorizon")
@@ -161,6 +194,7 @@ def scan_symbol(tech_path: str, signals_path: str) -> list:
             "Date":              last_date,
             "SignalSinceDate":   since_date,
             "Close":             last_close,
+            "SignalClose":       signal_close,
             "SignalName":        row["SignalName"],
             "Direction":         row["Direction"],
             "HorizonClass":      row["HorizonClass"],
@@ -249,15 +283,20 @@ def main():
 
     hits_df = hits_df.sort_values("CompositeScore", ascending=False)
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    # SignalSinceDate is a console-only column (see get_since_date) -- the
-    # saved CSV keeps exactly the same schema it always has.
-    csv_cols = [c for c in hits_df.columns if c != "SignalSinceDate"]
-    hits_df[csv_cols].to_csv(OUTPUT_FILE, index=False)
+    # SignalSinceDate/SignalClose are now saved too, not console-only as
+    # SignalSinceDate used to be: the Target*_Price columns are anchored to
+    # SignalClose rather than to Close, so without them the CSV would carry a
+    # target ladder that can't be reconciled against any price in the file.
+    hits_df.to_csv(OUTPUT_FILE, index=False)
     as_of = hits_df["Date"].max()
     print(f"\n{len(hits_df)} currently-active validated signals (as of {as_of.date()}) -> {OUTPUT_FILE}")
 
+    # SignalClose sits next to Close so the gap between "price when it fired"
+    # and "price now" is readable at a glance -- that gap is how much of the
+    # target ladder a still-active signal has already travelled.
     cols = ["Symbol", "Date", "SignalName", "HorizonClass", "Count", "CompositeScore",
-            "Close", "Target1_Price", "Target2_Price", "Target3_Price", "BestHorizon"]
+            "SignalClose", "Close", "Target1_Price", "Target2_Price", "Target3_Price",
+            "BestHorizon"]
     for direction in ["Bullish", "Bearish"]:
         sub = hits_df[hits_df["Direction"] == direction].head(args.top).copy()
         # Display-only: show when the signal's episode actually started,
