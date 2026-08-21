@@ -41,6 +41,7 @@ Usage:
     python signal_scanner.py --no-fisher
     python signal_scanner.py --max-concentration 0.5
     python signal_scanner.py --keep-concentrated
+    python signal_scanner.py --skip-bearish
 """
 
 import os
@@ -1134,11 +1135,29 @@ def build_combo_mask(signal_names, signal_map_np: Dict[str, np.ndarray]) -> np.n
 # PER-SYMBOL PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
+def load_existing_direction(out_path: str, direction: str) -> Optional[pd.DataFrame]:
+    """The rows of one Direction from an already-written per-symbol signals
+    file, or None if there is no usable file. Used only by --skip-bearish's
+    carry-forward (see run_symbol) -- a partial rescan must not delete the
+    half of the file it didn't recompute."""
+    if not os.path.exists(out_path):
+        return None
+    try:
+        prev = pd.read_csv(out_path)
+    except Exception:
+        return None
+    if prev.empty or "Direction" not in prev.columns:
+        return None
+    subset = prev[prev["Direction"] == direction]
+    return subset if not subset.empty else None
+
+
 def run_symbol(filepath: str, test_triples: bool = False,
                exclude_concentrated: bool = True,
                concentration_threshold: Optional[float] = None,
                exclude_regime_untested: bool = True,
-               min_drawdown_for_regime_test: Optional[float] = None
+               min_drawdown_for_regime_test: Optional[float] = None,
+               skip_bearish: bool = False
                ) -> Optional[pd.DataFrame]:
     """
     exclude_concentrated: when True (default), signals whose Concentration_Flag
@@ -1157,6 +1176,17 @@ def run_symbol(filepath: str, test_triples: bool = False,
     min_drawdown_for_regime_test: overrides MIN_DRAWDOWN_FOR_REGIME_TEST for
     this run only (does not change how the flag itself is computed if left
     None -- it's threaded through to compute_regime_windows).
+    skip_bearish: when True, score only Bullish signals/strategies/combos.
+    The exhaustive-pairs stage is O(n^2) per direction and every combo costs
+    a full score_signal() across three horizons plus (unless --no-fisher)
+    three Fisher tests, so dropping the Bearish half removes about half of
+    that stage -- but NOT half the wall-clock time, because the per-symbol
+    fixed costs (CSV read, add_forward_windows, compute_all_signals, the
+    benchmark merge, precompute_horizon_arrays, compute_regime_windows) are
+    paid once either way. Measured on RELIANCE: 28.5s -> 20.0s, roughly a
+    30% saving. The Bearish rows already on disk for this symbol are carried
+    forward into the rewritten CSV rather than deleted -- see the write step
+    at the end of this function.
     """
     try:
         df = pd.read_csv(filepath, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
@@ -1243,12 +1273,16 @@ def run_symbol(filepath: str, test_triples: bool = False,
         direction = direction_map.get(name, "Both")
         if direction == "Both":
             continue
+        if skip_bearish and direction == "Bearish":
+            continue
         evaluate(name, [name], signal_map_np[name], direction)
 
     # Predefined strategies
     for strat_name, spec in PREDEFINED_STRATEGIES.items():
         sig_names = spec["signals"]
         direction = spec["direction"]
+        if skip_bearish and direction == "Bearish":
+            continue
         if not TALIB_AVAILABLE and any(s.startswith("CDL_") for s in sig_names):
             continue
         try:
@@ -1257,8 +1291,18 @@ def run_symbol(filepath: str, test_triples: bool = False,
         except Exception:
             continue
 
+    # The exhaustive pair/triple stages below are where --skip-bearish
+    # actually buys its time: both are O(n^2)/O(n^3) over each direction's
+    # active signal list, and each combo costs a full score_signal() across
+    # three horizons plus three Fisher tests. Dropping one direction's list
+    # here removes that whole half of the work, rather than computing it and
+    # discarding it at ranking time.
+    direction_lists = [("Bullish", bull_signals)]
+    if not skip_bearish:
+        direction_lists.append(("Bearish", bear_signals))
+
     # Exhaustive pairs
-    for direction, sig_list in [("Bullish", bull_signals), ("Bearish", bear_signals)]:
+    for direction, sig_list in direction_lists:
         active = [n for n in sig_list if n in signal_map_np and signal_map_np[n].sum() >= MIN_OCCURRENCES // 2]
         for s1, s2 in itertools.combinations(active, 2):
             mask_arr = signal_map_np[s1] & signal_map_np[s2]
@@ -1266,7 +1310,7 @@ def run_symbol(filepath: str, test_triples: bool = False,
 
     # Exhaustive triples
     if test_triples:
-        for direction, sig_list in [("Bullish", bull_signals), ("Bearish", bear_signals)]:
+        for direction, sig_list in direction_lists:
             active = sorted(
                 [n for n in sig_list if n in signal_map_np and signal_map_np[n].sum() >= MIN_OCCURRENCES],
                 key=lambda n: -signal_map_np[n].sum()
@@ -1277,11 +1321,22 @@ def run_symbol(filepath: str, test_triples: bool = False,
 
     if not rows:
         if VERBOSE: print(f"  [SKIP] No valid signals for {symbol}")
-        return None, np.array([], dtype=np.float64)
+        # Returns bare None, not the (None, array) tuple this used to return:
+        # every caller tests `if top_df is not None` and then concats, so a
+        # tuple would sail past that guard and blow up in pd.concat. Scoring
+        # only one direction makes an empty `rows` meaningfully more likely
+        # to be hit than it was before --skip-bearish existed.
+        return None
 
     result_df = pd.DataFrame(rows)
     result_df["Symbol"]  = symbol
     result_df["Company"] = company
+    # Which price history these scores were computed over -- the last date in
+    # the input file, not wall-clock time, since that's what actually
+    # determines the numbers. This is what makes a bearish row carried
+    # forward by --skip-bearish visibly older than the bullish rows beside
+    # it, instead of the two being indistinguishable in the saved CSV.
+    result_df["ScoredThrough"] = df["Date"].max().strftime("%Y-%m-%d")
 
     thresh = concentration_threshold if concentration_threshold is not None else CONCENTRATION_THRESHOLD
     if exclude_concentrated:
@@ -1309,14 +1364,34 @@ def run_symbol(filepath: str, test_triples: bool = False,
     bear_top = rankable_df[rankable_df["Direction"] == "Bearish"].head(TOP_N_PER_DIR)
     top_df   = pd.concat([bull_top, bear_top], ignore_index=True)
 
-    if top_df.empty:
+    out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
+
+    # A bullish-only rescan must not delete the Bearish half of an existing
+    # file. run_symbol rewrites the whole CSV every time, so without this the
+    # first --skip-bearish run would silently destroy every bearish track
+    # record for this symbol -- including for live_signal_scan.py, which
+    # reads these files -- and only a full rescan could bring them back.
+    # Carry the old rows forward instead. They keep their original
+    # ScoredThrough value (blank for files written before that column
+    # existed), which is what marks them as older than the freshly-scored
+    # bullish rows they now sit beside.
+    carried = load_existing_direction(out_path, "Bearish") if skip_bearish else None
+    n_carried = 0 if carried is None else len(carried)
+    saved_df = pd.concat([top_df, carried], ignore_index=True) if n_carried else top_df
+
+    if saved_df.empty:
         if VERBOSE: print(f"  [SKIP] No rankable signals for {symbol} after concentration/regime filters")
         return None
 
-    out_path = os.path.join(OUTPUT_FOLDER, f"{symbol}_signals.csv")
-    top_df.to_csv(out_path, index=False)
-    if VERBOSE: print(f"  ✓ Saved {out_path}  ({len(top_df)} signals)")
-    return top_df
+    saved_df.to_csv(out_path, index=False)
+    if VERBOSE:
+        note = f" (+{n_carried} bearish carried forward)" if n_carried else ""
+        print(f"  ✓ Saved {out_path}  ({len(saved_df)} signals){note}")
+
+    # Only the freshly-scored rows feed the cross-symbol leaderboard --
+    # folding carried-forward bearish rows from an older scan into this run's
+    # aggregate would quietly blend two different as-of dates into one number.
+    return top_df if not top_df.empty else None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CROSS-SYMBOL LEADERBOARD
@@ -1362,12 +1437,13 @@ def _run_symbol_worker(args):
     when the target isn't a plain top-level call with keyword args baked in
     at submit time)."""
     (filepath, test_triples, exclude_concentrated, concentration_threshold,
-     exclude_regime_untested, min_drawdown_for_regime_test) = args
+     exclude_regime_untested, min_drawdown_for_regime_test, skip_bearish) = args
     return run_symbol(filepath, test_triples=test_triples,
                        exclude_concentrated=exclude_concentrated,
                        concentration_threshold=concentration_threshold,
                        exclude_regime_untested=exclude_regime_untested,
-                       min_drawdown_for_regime_test=min_drawdown_for_regime_test)
+                       min_drawdown_for_regime_test=min_drawdown_for_regime_test,
+                       skip_bearish=skip_bearish)
 
 
 def main():
@@ -1388,6 +1464,15 @@ def main():
     parser.add_argument("--keep-regime-untested", action="store_true",
                          help="Do not exclude regime-untested signals from the top-N ranking "
                               "(they still get RegimeTested_Flag either way)")
+    parser.add_argument("--skip-bearish", action="store_true",
+                         help="Score Bullish signals only. Skips the Bearish half of the "
+                              "exhaustive pair/triple search, the most expensive stage in the "
+                              "scan -- about a 30%% saving in wall-clock time (measured 28.5s -> "
+                              "20.0s on RELIANCE), not 50%%, since the per-symbol setup costs are "
+                              "paid either way. Bearish rows already on disk are CARRIED FORWARD "
+                              "into each rewritten per-symbol CSV rather than deleted -- they keep "
+                              "their older ScoredThrough date, and the cross-symbol leaderboard is "
+                              "built from this run's fresh rows only.")
     args = parser.parse_args()
 
     global COMPUTE_FISHER
@@ -1406,7 +1491,8 @@ def main():
                    exclude_concentrated=exclude_concentrated,
                    concentration_threshold=args.max_concentration,
                    exclude_regime_untested=exclude_regime_untested,
-                   min_drawdown_for_regime_test=args.min_drawdown)
+                   min_drawdown_for_regime_test=args.min_drawdown,
+                   skip_bearish=args.skip_bearish)
         return
 
     files = sorted(glob.glob(os.path.join(INPUT_FOLDER, f"*{DATA_SUFFIX}")))
@@ -1436,7 +1522,8 @@ def main():
     done = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         job_args = [(fp, args.triples, exclude_concentrated, args.max_concentration,
-                     exclude_regime_untested, args.min_drawdown) for fp in files]
+                     exclude_regime_untested, args.min_drawdown, args.skip_bearish)
+                    for fp in files]
         futures = {executor.submit(_run_symbol_worker, ja): ja[0] for ja in job_args}
         for future in as_completed(futures):
             fp = futures[future]
@@ -1462,8 +1549,9 @@ def main():
     if not lb.empty:
         print("\n── Top 15 Universal Bull Signals ──")
         print(lb[lb["Direction"] == "Bullish"].head(15).to_string(index=False))
-        print("\n── Top 15 Universal Bear Signals ──")
-        print(lb[lb["Direction"] == "Bearish"].head(15).to_string(index=False))
+        if not args.skip_bearish:
+            print("\n── Top 15 Universal Bear Signals ──")
+            print(lb[lb["Direction"] == "Bearish"].head(15).to_string(index=False))
 
 
 if __name__ == "__main__":
