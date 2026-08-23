@@ -1,0 +1,150 @@
+name: Daily Signal Scan
+
+# Refreshes data/technical from Yahoo, then re-runs live_signal_scan.py and
+# commits both back to the repo.
+#
+# READ THIS BEFORE ENABLING: this repo stores its own dataset in git, and
+# fetch_technical_data.py rewrites every one of the ~2100 CSVs in full on each
+# run (it recomputes indicators over the whole history, so the entire file
+# changes, not just the appended rows). Each run therefore commits ~1.1GB of
+# fresh blobs. Git history is immutable, so that growth is permanent and
+# compounding -- .git is already ~4.7GB packed after only 71 commits, and
+# GitHub enforces a 2GB-per-push limit and strongly recommends staying under
+# 5GB total. This workflow will push that repo over the line within weeks.
+# The durable fix is to stop tracking data/ and results/ in git and restore
+# them from object storage (S3/B2/R2) at the start of each run instead; the
+# "Commit refreshed data" step at the bottom is the piece to replace.
+
+on:
+  schedule:
+    # 12:30 UTC = 18:00 IST, Mon-Fri. NSE closes at 15:30 IST; this leaves
+    # Yahoo a couple of hours to settle the day's bars before we ask for them.
+    # Weekends are excluded because there is nothing new to fetch -- the run
+    # would just print "already up to date" 2136 times.
+    # NOTE: GitHub runs scheduled workflows late under load (10-30 min is
+    # routine) and silently drops them at peak. Treat this time as a hint, and
+    # do not build anything that assumes an exact daily cadence.
+    - cron: "30 12 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      skip_bearish:
+        description: "Scan bullish signals only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # the commit-back step pushes to this repo
+
+concurrency:
+  # Two overlapping runs would both rewrite the same 2100 CSVs and then race
+  # on the push. Queue them instead of cancelling: a half-finished fetch that
+  # gets cancelled mid-write is worse than a late run.
+  group: daily-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (shallow)
+        uses: actions/checkout@v4
+        with:
+          # Not optional. The tip tree alone is ~1.2GB (the tracked dataset)
+          # and history adds ~4.7GB on top; a full clone would spend most of
+          # the job downloading commits nothing here reads.
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install TA-Lib C library
+        # The `TA-Lib` PyPI package is a wrapper over a C library that is not
+        # bundled in the wheel and is not in Ubuntu's repos, so it must exist
+        # before pip can build against it. Installing upstream's .deb rather
+        # than building from source: same result, seconds instead of minutes.
+        # Bump this version if the URL 404s -- the C library and the Python
+        # wrapper are released separately and drift.
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/ta-lib.deb \
+            https://github.com/TA-Lib/ta-lib/releases/download/v0.6.4/ta-lib_0.6.4_amd64.deb
+          sudo dpkg -i /tmp/ta-lib.deb
+          sudo ldconfig
+          echo "TA-Lib C library installed"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import talib; print('talib wrapper', talib.__version__)"
+
+      - name: Update price data
+        # --workers 3, not the local default of 8. Yahoo rate-limits the
+        # datacenter IP ranges every GitHub runner sits in far harder than a
+        # residential connection, and concurrency is what trips it. Going
+        # slower here is the difference between a complete fetch and a
+        # failed_tickers.txt with hundreds of entries.
+        run: python scripts/fetch_technical_data.py --workers 3
+
+      - name: Run live signal scan
+        run: |
+          python scripts/live_signal_scan.py \
+            ${{ inputs.skip_bearish && '--skip-bearish' || '' }} \
+            | tee scan.log
+
+      - name: Job summary
+        if: always()
+        # Surfaces the headline numbers on the run's summary page so a failure
+        # or an empty scan is visible without opening the raw logs.
+        run: |
+          {
+            echo "### Daily signal scan"
+            echo ""
+            grep -E "currently-active|by status|also written" scan.log 2>/dev/null || echo "Scan produced no summary line."
+            if [ -s failed_tickers.txt ]; then
+              echo ""
+              echo "**$(wc -l < failed_tickers.txt) tickers still failing after retry.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        # So the day's output can be downloaded without cloning a 1.2GB repo.
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: signals-${{ github.run_id }}
+          path: |
+            results/current_signals.csv
+            results/current_signals.xlsx
+            failed_tickers.txt
+            scan.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Commit refreshed data
+        # This is the step that grows the repo ~1.1GB per run -- see the
+        # warning at the top of this file. Replace it with an upload to
+        # object storage once data/ and results/ are gitignored.
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data/technical results
+          # Conditional: `git add` on a path that exists neither in the index
+          # nor on disk is a fatal pathspec error, which would abort the step
+          # under `set -e` on any run that had no failures at all.
+          [ -e failed_tickers.txt ] && git add failed_tickers.txt || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: daily data + signal scan $(date -u +%F) [skip ci]"
+          # Rebase before pushing so a local push made while this was running
+          # doesn't reject it after 20 minutes of work. On a shallow clone git
+          # deepens as needed to do this.
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

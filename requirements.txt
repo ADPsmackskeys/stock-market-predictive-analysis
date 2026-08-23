@@ -1,0 +1,9 @@
+# Pinned to the versions this pipeline is currently developed against locally
+# (python 3.12.3). TA-Lib is the thin Python wrapper only -- the C library it
+# links against is installed separately in .github/workflows/daily-scan.yml.
+pandas==2.3.1
+numpy==1.26.4
+yfinance==0.2.65
+scipy==1.16.1
+openpyxl==3.1.5
+TA-Lib==0.6.7
