@@ -58,7 +58,7 @@ Columns added beyond what signal_scanner.py stores per signal:
     fixed at the firing bar, comparing Close against Target1_Price is a
     real progress check: a signal several days old may already be past its
     own first target.
-  - SignalAgeDays / DaysRemaining / MFE_SoFar / TargetsHit / Status: where
+  - SignalAgeDays / DaysLeft / MFE_SoFar / TargetsHit / Status: where
     this hit sits between "just fired" and "horizon spent". A signal being
     active today says nothing about whether its target ladder is still
     ahead of it: state-type signals stay true for weeks, so by the time
@@ -67,14 +67,16 @@ Columns added beyond what signal_scanner.py stores per signal:
     may have run out altogether. These columns make that visible instead of
     leaving every row looking equally fresh:
       SignalAgeDays  -- trading rows since the firing bar (0 = fired today)
-      DaysRemaining  -- BestHorizon - SignalAgeDays; goes NEGATIVE once the
+      DaysLeft  -- BestHorizon - SignalAgeDays; goes NEGATIVE once the
                         horizon is spent, which is informative, not an error
       MFE_SoFar      -- favourable excursion actually realized so far, in
                         the same units as Target*_Pct (see get_mfe_so_far)
       TargetsHit     -- how many ladder rungs MFE_SoFar has cleared (0-3)
       Status         -- Fresh / Running / Complete / Expired (see the
                         STATUS_* constants and resolve_status)
-    Nothing is filtered on these -- they annotate, and the caller decides.
+    The workbook and the console report drop rows where DaysLeft < 0
+    or TargetsHit >= 3 (see filter_actionable); OUTPUT_FILE keeps every row
+    regardless, and stays the complete record.
   - Target1_HitDate: the first session on which the Target1 level was
     actually traded through, or blank if it never was inside BestHorizon.
     This uses a STRICTER definition of "hit" than TargetsHit/MFE_SoFar do,
@@ -112,6 +114,17 @@ OUTPUT_FILE = "results/current_signals.csv"
 # stays the primary/canonical output -- the workbook is written from it and is
 # skipped without failing the run if openpyxl isn't installed.
 OUTPUT_XLSX = "results/current_signals.xlsx"
+
+# Columns on the workbook's per-symbol "Targets" sheet -- the target ladder
+# alone, stripped of the scoring/diagnostic columns, for reading off levels.
+# "Close" is renamed to CurrentClose there so it reads unambiguously next to
+# SignalClose (the price the ladder is anchored to, which is NOT today's).
+TARGET_SHEET_COLS = [
+    "Symbol", "SignalClose", "Close", "TargetsHit", "Target1_HitDate",
+    "Target1_Pct", "Target1_Price",
+    "Target2_Pct", "Target2_Price",
+    "Target3_Pct", "Target3_Price",
+]
 
 
 def get_since_index(components: list, signal_map: dict, n_rows: int):
@@ -456,6 +469,31 @@ def scan_symbol(tech_path: str, signals_path: str, skip_bearish: bool = False) -
     return hits
 
 
+def filter_actionable(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop hits whose move is already over: the horizon has run out
+    (DaysLeft < 0) or the entire ladder has been delivered
+    (TargetsHit >= 3). What survives is the subset with something still
+    ahead of it.
+
+    Applied to the workbook and the console report but deliberately NOT to
+    OUTPUT_FILE. The CSV stays the complete record of everything that was
+    active, so a row hidden here is still recoverable instead of gone --
+    which matters because "spent" is a judgement based on BestHorizon and
+    the MFE quantiles, not a fact about the stock.
+
+    Rows with no BestHorizon at all (DaysLeft NaN, Status Unknown) are
+    KEPT: `.lt(0)` is False for NaN, and that is the intended behaviour --
+    "can't tell whether it is spent" is not the same as "it is spent", and
+    dropping those would remove them from both views at once with nothing
+    left to notice them by.
+    """
+    if df.empty:
+        return df
+    spent    = df["DaysLeft"].lt(0)
+    finished = df["TargetsHit"].ge(3)
+    return df[~(spent | finished)]
+
+
 def write_excel(hits_df: pd.DataFrame, path: str) -> bool:
     """Write the scan to a workbook, one sheet per direction, with the header
     row frozen and an autofilter across it so the sheet can be sorted and
@@ -488,6 +526,22 @@ def write_excel(hits_df: pd.DataFrame, path: str) -> bool:
         # empty workbook is a file Excel refuses to open, so fall back to one
         # sheet holding everything rather than writing something unopenable.
         sheets = [("Signals", out)]
+
+    # Target ladders, first sheet because it is the digest the rest of the
+    # workbook backs up.
+    #
+    # ONE ROW PER SIGNAL, not per symbol -- a stock that fires a dozen
+    # validated signals gets a dozen rows here, deliberately. They share
+    # Symbol/SignalClose/CurrentClose but carry genuinely different ladders,
+    # since each signal's targets come from its own MFE quantiles at its own
+    # BestHorizon. Collapsing to the best-scoring signal per symbol would
+    # throw away the other eleven ladders, which is the opposite of what this
+    # sheet is for. Ordered by CompositeScore so a symbol's strongest signal
+    # leads, matching every other view here.
+    targets = out.sort_values("CompositeScore", ascending=False)
+    tcols = [c for c in TARGET_SHEET_COLS if c in targets.columns]
+    targets = targets[tcols].rename(columns={"Close": "CurrentClose"})
+    sheets.insert(0, ("Targets", targets))
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
@@ -598,9 +652,21 @@ def main():
     status_counts = hits_df["Status"].value_counts()
     print("  by status: " + ", ".join(f"{k} {v}" for k, v in status_counts.items()))
 
-    if not args.no_excel and write_excel(hits_df, OUTPUT_XLSX):
-        print(f"{len(hits_df)} rows also written to {OUTPUT_XLSX} "
-              f"(one sheet per direction, filterable)")
+    # Everything below this line works off the actionable subset; the CSV
+    # written above keeps the full set. See filter_actionable.
+    view_df = filter_actionable(hits_df)
+    n_hidden = len(hits_df) - len(view_df)
+    if n_hidden:
+        print(f"  ({n_hidden} spent hit(s) hidden from the workbook and the report below "
+              f"-- horizon expired or all 3 targets already hit; {OUTPUT_FILE} keeps them)")
+
+    if view_df.empty:
+        print("\nNo hits with anything still ahead of them.")
+        return
+
+    if not args.no_excel and write_excel(view_df, OUTPUT_XLSX):
+        print(f"{len(view_df)} rows also written to {OUTPUT_XLSX} "
+              f"(Targets sheet + one sheet per direction, filterable)")
 
     # SignalClose sits next to Close so the gap between "price when it fired"
     # and "price now" is readable at a glance -- that gap is how much of the
@@ -613,8 +679,8 @@ def main():
             "Target1_Price", "Target2_Price", "Target3_Price", "BestHorizon"]
     directions = ["Bullish"] if args.skip_bearish else ["Bullish", "Bearish"]
     for direction in directions:
-        sub = hits_df[(hits_df["Direction"] == direction) &
-                      (hits_df["CompositeScore"] > args.min_print_composite)].copy()
+        sub = view_df[(view_df["Direction"] == direction) &
+                      (view_df["CompositeScore"] > args.min_print_composite)].copy()
         print(f"\n── {len(sub)} Active {direction} Signals "
               f"(CompositeScore > {args.min_print_composite}) ──")
         if sub.empty:
