@@ -72,21 +72,25 @@ Columns added beyond what signal_scanner.py stores per signal:
       MFE_SoFar      -- favourable excursion actually realized so far, in
                         the same units as Target*_Pct (see get_mfe_so_far)
       TargetsHit     -- how many ladder rungs MFE_SoFar has cleared (0-3)
+      CalendarAgeDays -- wall-clock days since the firing bar. Differs from
+                        SignalAgeDays whenever a stock's sessions are not
+                        daily (see CALENDAR_DAYS_PER_SESSION).
       Status         -- Fresh / Running / Complete / Expired (see the
                         STATUS_* constants and resolve_status)
-    The workbook and the console report drop rows where DaysLeft < 0
-    or TargetsHit >= 3 (see filter_actionable); OUTPUT_FILE keeps every row
-    regardless, and stays the complete record.
+    Spent rows -- horizon gone by session count OR by calendar age, see
+    is_spent -- are dropped from OUTPUT_FILE, the workbook and the console
+    alike: this file is the list of signals that are currently live, and a
+    signal whose horizon has run out is not one. The workbook and console
+    additionally drop TargetsHit >= 3 (see filter_actionable), which the CSV
+    keeps -- a delivered ladder is a result worth recording, an expired
+    horizon is not.
   - Target1_HitDate: the first session on which the Target1 level was
-    actually traded through, or blank if it never was inside BestHorizon.
-    This uses a STRICTER definition of "hit" than TargetsHit/MFE_SoFar do,
-    and the two can legitimately disagree -- see get_target_hit_date. In
-    short: MFE_SoFar counts a momentary wick, this counts only levels that
-    fell inside the day's Open-Close body or inside the overnight gap
-    between the previous Close and that day's Open. A row can therefore
-    show TargetsHit >= 1 with a blank Target1_HitDate, meaning the level was
-    brushed by a spike but never traded through in a way you could
-    plausibly have been filled at.
+    reached, or blank if it never was inside BestHorizon. "Reached" is the
+    session's High for a Bullish signal and its Low for a Bearish one --
+    the same extremes MFE_SoFar and TargetsHit are built from, so the two
+    columns agree by construction. A target is a resting limit order: it
+    fills the moment the session trades at the level, whether or not price
+    closed beyond it.
 
 Usage:
     python scripts/live_signal_scan.py
@@ -107,6 +111,20 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import signal_scanner as ss
+
+# BestHorizon is counted in SESSIONS, but a session is only ~a day for a
+# stock that actually trades daily. fetch_technical_data.py strips
+# zero-volume rows, so for an illiquid name the file holds one row per week
+# or worse and "30 sessions left" can span most of a year -- GFSTEELS fired
+# on 2026-05-11 and was still being reported as a live signal with DaysLeft
+# 15 on 2026-08-31, 112 calendar days later, because only 15 rows exist in
+# between. NSE runs ~250 sessions a year, so one session is ~1.45 calendar
+# days; a signal is called stale once its calendar age exceeds its horizon's
+# expected calendar span by more than STALE_TOLERANCE. The tolerance is
+# generous on purpose -- this is meant to catch a horizon stretched over
+# months by illiquidity, not to second-guess an ordinary run of holidays.
+CALENDAR_DAYS_PER_SESSION = 1.45
+STALE_TOLERANCE = 2.0
 
 OUTPUT_FILE = "results/current_signals.csv"
 # Same content as OUTPUT_FILE, split one sheet per direction and set up as a
@@ -279,27 +297,32 @@ def get_target_level(direction: str, anchor: float, target_pct) -> float:
     return float(anchor) * (1.0 + float(target_pct))
 
 
-def get_target_hit_date(opens, closes, dates, since_idx, best_h, level):
-    """First session within BestHorizon on which `level` was actually traded
-    through, or NaT if it never was.
+def get_target_hit_date(highs, lows, dates, since_idx, best_h, level, direction):
+    """First session within BestHorizon on which `level` was reached, or NaT
+    if it never was.
 
-    "Traded through" is deliberately a stricter test than the one MFE_SoFar
-    and TargetsHit use, and the two can disagree on the same row. MFE_SoFar
-    asks only whether the day's High (or Low) reached the level, which counts
-    a momentary wick that price immediately left. This asks whether the level
-    fell inside one of two ranges price genuinely traversed:
+    Reached means the session's High got to it (Bullish) or its Low got down
+    to it (Bearish) -- the SAME extremes the target ladder is defined in.
+    signal_scanner.py builds MFE_Target_P10/P20/P30 as quantiles of
+    MFE_Bull/Bear_{h}D, which are themselves rolling High maxima / Low minima
+    (see add_forward_windows), and TargetsHit counts a target as hit by
+    comparing MFE_SoFar against those same quantiles. Testing the hit DATE by
+    any other rule makes this column contradict the TargetsHit column beside
+    it, computed from one ladder under two different definitions of "hit".
 
-      1. the day's body -- between that session's Open and Close; or
-      2. the overnight gap -- between the previous session's Close and this
-         session's Open. Without this second case a target that the market
-         jumped clean over between sessions would never register as hit,
-         because price never printed inside either day's body at that level,
-         even though it unambiguously passed through it.
+    This previously tested whether the level fell inside the day's Open-Close
+    body or the overnight gap, deliberately excluding wick-only touches. That
+    is the wrong test for a target: a target is a resting limit order, and an
+    order resting at the level fills the moment the session trades there --
+    whether or not price closed beyond it. SKYGOLD is the worked example: T1
+    at 822.62 against a 2026-09-08 session that opened 789.05, closed 820.00
+    and made a high of 833.25. The market traded well through 822.62 and any
+    resting sell was filled, but the level sat outside the body and outside
+    the gap, so the old rule reported the target as never hit while
+    TargetsHit on the same row already said 1.
 
-    Wick-only touches are excluded on purpose, so this column can be blank on
-    a row whose TargetsHit is already 1. Scanning forward from the firing bar
-    and returning on the first match makes this the EARLIEST such session,
-    not the most recent.
+    Scanning forward from the firing bar and returning on the first match
+    makes this the EARLIEST such session, not the most recent.
 
     Takes preconverted numpy arrays rather than the DataFrame because it is
     called once per scored row per symbol; re-running .to_numpy() on the full
@@ -307,15 +330,15 @@ def get_target_hit_date(opens, closes, dates, since_idx, best_h, level):
     """
     if since_idx is None or pd.isna(best_h) or pd.isna(level):
         return pd.NaT
+    bullish = direction != "Bearish"
+    series = highs if bullish else lows
     start = since_idx + 1
-    end = min(len(closes) - 1, since_idx + int(best_h))
+    end = min(len(series) - 1, since_idx + int(best_h))
     for d in range(start, end + 1):
-        o, c, prev_c = opens[d], closes[d], closes[d - 1]
-        if np.isnan(o) or np.isnan(c):
+        v = series[d]
+        if np.isnan(v):
             continue
-        if min(o, c) <= level <= max(o, c):
-            return dates.iloc[d]
-        if not np.isnan(prev_c) and min(prev_c, o) <= level <= max(prev_c, o):
+        if (v >= level) if bullish else (v <= level):
             return dates.iloc[d]
     return pd.NaT
 
@@ -360,8 +383,8 @@ def scan_symbol(tech_path: str, signals_path: str, skip_bearish: bool = False) -
     atr_pct_now = get_current_atr_pct(df)
     # Converted once per symbol, not once per scored row -- get_target_hit_date
     # walks these for every hit and would otherwise rebuild them each time.
-    opens_arr  = df["Open"].to_numpy(dtype=float)
-    closes_arr = df["Close"].to_numpy(dtype=float)
+    highs_arr = df["High"].to_numpy(dtype=float)
+    lows_arr  = df["Low"].to_numpy(dtype=float)
 
     hits = []
     for _, row in scored.iterrows():
@@ -417,6 +440,11 @@ def scan_symbol(tech_path: str, signals_path: str, skip_bearish: bool = False) -
         best_h = row.get("BestHorizon", np.nan)
         age = (len(df) - 1 - since_idx) if since_idx is not None else 0
         days_remaining = (int(best_h) - age) if not pd.isna(best_h) else np.nan
+        # Wall-clock age of the same signal. Carried as its own column rather
+        # than derived at filter time so a stale row is self-evidently stale
+        # in the CSV instead of only being explicable by reading the price
+        # file -- see CALENDAR_DAYS_PER_SESSION.
+        calendar_age = int((last_date - since_date).days) if since_idx is not None else 0
         mfe_so_far = get_mfe_so_far(df, since_idx, row["Direction"], best_h)
         targets_hit, targets_available = count_targets_hit(
             mfe_so_far,
@@ -426,13 +454,14 @@ def scan_symbol(tech_path: str, signals_path: str, skip_bearish: bool = False) -
         )
         status = resolve_status(age, best_h, targets_hit, targets_available)
 
-        # When T1 was actually traded through (body or overnight gap), as
-        # opposed to merely brushed by a wick -- see get_target_hit_date.
+        # The session T1 was first reached in, on the same High/Low basis
+        # TargetsHit uses -- see get_target_hit_date.
         target1_level = get_target_level(
             row["Direction"], signal_close,
             row.get("Target1_Conservative_BestHorizon", np.nan))
         target1_hit_date = get_target_hit_date(
-            opens_arr, closes_arr, df["Date"], since_idx, best_h, target1_level)
+            highs_arr, lows_arr, df["Date"], since_idx, best_h, target1_level,
+            row["Direction"])
 
         hits.append({
             "Symbol":            row["Symbol"],
@@ -441,6 +470,7 @@ def scan_symbol(tech_path: str, signals_path: str, skip_bearish: bool = False) -
             "Close":             last_close,
             "SignalClose":       signal_close,
             "SignalAgeDays":     age,
+            "CalendarAgeDays":   calendar_age,
             "DaysLeft":     days_remaining,
             "MFE_SoFar":         round(mfe_so_far, 5) if not pd.isna(mfe_so_far) else np.nan,
             "TargetsHit":        targets_hit,
@@ -489,9 +519,27 @@ def filter_actionable(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return df
-    spent    = df["DaysLeft"].lt(0)
+    spent    = is_spent(df)
     finished = df["TargetsHit"].ge(3)
     return df[~(spent | finished)]
+
+
+def is_spent(df: pd.DataFrame) -> pd.Series:
+    """Rows whose horizon is gone, by either clock.
+
+    DaysLeft < 0 is the session count running out. The calendar test catches
+    the case sessions cannot see: an illiquid stock whose sessions are weeks
+    apart, where DaysLeft is still comfortably positive while the signal is
+    months old (see CALENDAR_DAYS_PER_SESSION).
+
+    NaN BestHorizon stays False on both tests -- `.lt`/`.gt` are False for
+    NaN, and "can't tell whether it is spent" must not be read as "it is".
+    """
+    spent_sessions = df["DaysLeft"].lt(0)
+    if "CalendarAgeDays" not in df.columns:
+        return spent_sessions
+    budget = df["BestHorizon"] * CALENDAR_DAYS_PER_SESSION * STALE_TOLERANCE
+    return spent_sessions | df["CalendarAgeDays"].gt(budget)
 
 
 def write_excel(hits_df: pd.DataFrame, path: str) -> bool:
@@ -643,9 +691,23 @@ def main():
     # SignalSinceDate used to be: the Target*_Price columns are anchored to
     # SignalClose rather than to Close, so without them the CSV would carry a
     # target ladder that can't be reconciled against any price in the file.
+    # Spent rows are dropped from the CSV as well, not just the workbook and
+    # the console: a horizon that has run out (by either clock) is not a
+    # "currently-active validated signal", which is what this file is for.
+    # TargetsHit >= 3 is deliberately NOT dropped here -- a delivered ladder
+    # is a result worth keeping, whereas an expired one is just noise.
+    spent_mask = is_spent(hits_df)
+    n_expired = int(spent_mask.sum())
+    hits_df = hits_df[~spent_mask]
+    if hits_df.empty:
+        print(f"No currently-active validated signals remain "
+              f"({n_expired} expired hit(s) dropped).")
+        return
     hits_df.to_csv(OUTPUT_FILE, index=False)
     as_of = hits_df["Date"].max()
     print(f"\n{len(hits_df)} currently-active validated signals (as of {as_of.date()}) -> {OUTPUT_FILE}")
+    if n_expired:
+        print(f"  ({n_expired} expired hit(s) dropped -- horizon spent by session or calendar count)")
     # Lifecycle breakdown up front: "active today" and "still has its move
     # ahead of it" are very different populations, and the split between them
     # is the first thing worth knowing about a scan.

@@ -203,7 +203,7 @@ STRATEGY_HORIZON_OVERRIDE = {
 # was really only 17 episodes now needs 10 genuinely separate occurrences, not
 # 10 days that could all belong to the same multi-week persistent state.
 MIN_OCCURRENCES = 10
-TOP_N_PER_DIR   = 25
+TOP_N_PER_DIR   = 3000
 COMPUTE_FISHER  = True
 FISHER_ALPHA    = 0.10
 TEST_TRIPLES    = False
@@ -603,6 +603,11 @@ def precompute_horizon_arrays(df: pd.DataFrame) -> Dict[int, Dict[str, np.ndarra
             "mfe_bear":  df[f"MFE_Bear_{h}D"].to_numpy(),
             "fwd_close": df[f"Fwd_Close_{h}D"].to_numpy(),
             "min_move":  ATR_THRESHOLD_K * atr_pct * np.sqrt(h),
+            # Same per-row ATR% the min_move threshold is built from, kept
+            # unscaled so score_signal can express each occurrence's return
+            # in units of that occurrence's own ATR (see ev_atr there). Same
+            # array object for every horizon -- a reference, not a copy.
+            "atr_pct":   atr_pct,
             "bench_fwd_close": (
                 df[bench_col].to_numpy() if bench_col in df.columns else np.full(n, np.nan)
             ),
@@ -871,11 +876,16 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
                      edge is riding on one idiosyncratic event, not a
                      repeatable pattern, even when Count clears
                      MIN_OCCURRENCES.
-      CompositeScore_{h}D — per-horizon quality score (EV × max(min(PF,PF_CAP),1) × log1p(count))
+      EV_ATR_{h}D    — EV with each occurrence's return divided by that
+                     occurrence's own ATR%, i.e. expected value measured in
+                     ATRs instead of raw percent. This is what
+                     CompositeScore_{h}D scores; EV_{h}D stays raw.
+      CompositeScore_{h}D — per-horizon quality score (EV_ATR × max(min(PF,PF_CAP),1) × log1p(count))
 
     Aggregate metrics (across all horizons in the signal's class):
       Consistency    — 1 - range of win rates across horizons
-      CompositeScore — EV × max(min(PF,PF_CAP),1) × consistency × log1p(count)
+      AvgEV_ATR      — mean, across horizons, of EV_ATR_{h}D
+      CompositeScore — EV_ATR × max(min(PF,PF_CAP),1) × consistency × log1p(count)
       BestHorizon    — horizon with the highest CompositeScore_{h}D
       AvgMedianReturn      — mean, across horizons, of MedianReturn_Close_{h}D
       AvgWinRate_HitEV     — mean, across horizons, of WinRate_HitEV_{h}D
@@ -916,6 +926,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
     all_evs, all_srs, all_pfs, horizon_composites = [], [], [], []
     all_medians, all_top1_shares, all_hitrates = [], [], []
     all_evs_excess = []
+    all_evs_atr = []
     mfe_key    = "mfe_bull" if direction == "Bullish" else "mfe_bear"
     multiplier = 1.0 if direction == "Bullish" else -1.0
 
@@ -967,6 +978,35 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         avg_loss = float(losses_w.mean()) if losses_w.size > 0 else 0.0
 
         ev = win_rate * avg_win + loss_rate * avg_loss
+
+        # --- ATR-adjusted EV: the same expected value, but with every
+        # occurrence's return expressed in units of that occurrence's OWN
+        # ATR% rather than raw percent. EV in raw return units is not
+        # comparable across stocks -- a 2% EV on a 1.5%-ATR large cap and a
+        # 2% EV on a 6%-ATR small cap are not the same achievement -- and
+        # CompositeScore, which multiplies EV in, inherited that
+        # incomparability wholesale: it ranked high-volatility names above
+        # low-volatility ones largely independently of signal quality.
+        # Normalising per occurrence (rather than by one per-stock or
+        # as-of-today ATR) avoids pairing a multi-year numerator with a
+        # single-regime denominator. atr_pct is strictly positive wherever
+        # min_move is non-NaN, which valid_h already requires, so the
+        # division needs no guard. Winsorized on its own percentiles for the
+        # same reason the raw series is: the per-row rescaling means the
+        # clip bounds of rv do not carry over. The reported EV_{h}D / AvgEV
+        # columns stay in raw return units as the diagnostic they were.
+        atr_vals = harr["atr_pct"][valid_h]
+        rv_atr = rv / atr_vals
+        if rv_atr.size > 0:
+            lo_a, hi_a = _quantiles_sorted(rv_atr, (WINSOR_PCTL / 100.0, 1.0 - WINSOR_PCTL / 100.0))
+            rv_atr_w = np.clip(rv_atr, lo_a, hi_a)
+        else:
+            rv_atr_w = rv_atr
+        wins_atr_w   = rv_atr_w[win_mask]
+        losses_atr_w = rv_atr_w[~win_mask]
+        avg_win_atr  = float(wins_atr_w.mean())   if wins_atr_w.size   > 0 else 0.0
+        avg_loss_atr = float(losses_atr_w.mean()) if losses_atr_w.size > 0 else 0.0
+        ev_atr = win_rate * avg_win_atr + loss_rate * avg_loss_atr
 
         neg_losses_w   = losses_w[losses_w < 0]
         pos_wins_w     = wins_w[wins_w > 0]
@@ -1058,12 +1098,13 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         #   -- the stretch target.
         p10, p20, p30 = _quantiles_sorted(mfe_vals, (0.10, 0.20, 0.30))
 
-        composite_h = round(ev * max(pf_for_composite, 1.0) * np.log1p(count), 6)
+        composite_h = round(ev_atr * max(pf_for_composite, 1.0) * np.log1p(count), 6)
 
         result[f"WinRate_MFE_{h}D"]        = round(win_rate, 4)
         result[f"AvgWin_{h}D"]             = round(avg_win, 5)
         result[f"AvgLoss_{h}D"]            = round(avg_loss, 5)
         result[f"EV_{h}D"]                 = round(ev, 6)
+        result[f"EV_ATR_{h}D"]             = round(ev_atr, 6)
         result[f"ProfitFactor_{h}D"]       = round(pf_raw, 3) if not np.isnan(pf_raw) else np.nan
         result[f"AvgReturn_Close_{h}D"]    = round(float(close_vals.mean()), 5)
         result[f"MedianReturn_Close_{h}D"] = round(median_return, 5)
@@ -1078,6 +1119,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         result[f"CompositeScore_{h}D"]     = composite_h
 
         all_evs.append(ev)
+        all_evs_atr.append(ev_atr)
         all_srs.append(win_rate)
         all_pfs.append(pf_raw if not np.isnan(pf_raw) else 0.0)
         all_medians.append(median_return)
@@ -1092,6 +1134,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
         return None
 
     avg_ev      = float(np.mean(all_evs))
+    avg_ev_atr  = float(np.mean(all_evs_atr))
     avg_sr      = float(np.mean(all_srs))
     # AvgProfitFactor is the mean of the RAW per-horizon ratios (diagnostic);
     # avg_pf_for_composite is the separately-capped value used in scoring.
@@ -1102,7 +1145,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
     sr_range = max(all_srs) - min(all_srs) if len(all_srs) > 1 else 0.0
     consistency = max(1.0 - sr_range, 0.0)
 
-    composite = round(avg_ev * max(avg_pf_for_composite, 1.0) * consistency * np.log1p(count), 6)
+    composite = round(avg_ev_atr * max(avg_pf_for_composite, 1.0) * consistency * np.log1p(count), 6)
     best_h, best_h_composite = max(horizon_composites, key=lambda t: t[1])
 
     max_top1_share  = float(max(all_top1_shares)) if all_top1_shares else np.nan
@@ -1135,6 +1178,7 @@ def score_signal(mask_arr: np.ndarray, direction: str, signal_name: str,
 
     result.update({
         "AvgEV":                round(avg_ev, 6),
+        "AvgEV_ATR":            round(avg_ev_atr, 6),
         "AvgWinRate":           round(avg_sr, 4),
         "AvgProfitFactor":      round(avg_pf, 3),
         "Consistency":          round(consistency, 4),
