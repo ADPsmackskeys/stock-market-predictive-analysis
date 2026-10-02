@@ -106,6 +106,7 @@ import os
 import sys
 import glob
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
@@ -499,6 +500,19 @@ def scan_symbol(tech_path: str, signals_path: str, skip_bearish: bool = False) -
     return hits
 
 
+def _scan_symbol_worker(job: tuple) -> list:
+    """Single-tuple adapter for ProcessPoolExecutor.map. Module-level so it
+    pickles. Exceptions are caught here rather than left to the pool: one
+    malformed symbol must not abort the whole scan, matching the serial loop's
+    behaviour where scan_symbol's own read failures just yield no hits."""
+    tech_path, sig_path, skip_bearish = job
+    try:
+        return scan_symbol(tech_path, sig_path, skip_bearish=skip_bearish)
+    except Exception as e:
+        print(f"  [ERROR] {os.path.basename(sig_path)}: {e}")
+        return []
+
+
 def filter_actionable(df: pd.DataFrame) -> pd.DataFrame:
     """Drop hits whose move is already over: the horizon has run out
     (DaysLeft < 0) or the entire ladder has been delivered
@@ -634,22 +648,38 @@ def main():
                               "~43%% of the hits, because the per-symbol compute_all_signals() "
                               "call dominates this script and is paid either way -- use it to "
                               "cut the output down to bullish-only, not as a speed fix.")
+    parser.add_argument("--workers", type=int, default=None,
+                         help="Worker processes (default: os.cpu_count()). Pass 1 to run serially.")
     args = parser.parse_args()
 
     # signal_scanner.py names outputs "{symbol}_data_signals.csv" (Path(...).stem
     # keeps the "_data" from the input filename, then "_signals.csv" is appended).
     signal_files = sorted(glob.glob(os.path.join(ss.OUTPUT_FOLDER, "*_data_signals.csv")))
-    print(f"Scanning {len(signal_files)} symbols for currently-active signals...")
-
-    all_hits = []
-    for i, sig_path in enumerate(signal_files, 1):
+    jobs = []
+    for sig_path in signal_files:
         symbol = os.path.basename(sig_path).replace("_data_signals.csv", "")
         tech_path = os.path.join(ss.INPUT_FOLDER, f"{symbol}{ss.DATA_SUFFIX}")
-        if not os.path.exists(tech_path):
-            continue
-        all_hits.extend(scan_symbol(tech_path, sig_path, skip_bearish=args.skip_bearish))
-        if i % 300 == 0:
-            print(f"  [{i}/{len(signal_files)}] scanned, {len(all_hits)} hits so far")
+        if os.path.exists(tech_path):
+            jobs.append((tech_path, sig_path, args.skip_bearish))
+
+    n_workers = max(1, args.workers or os.cpu_count() or 1)
+    print(f"Scanning {len(jobs)} symbols for currently-active signals "
+          f"across {n_workers} worker process(es)...")
+
+    # Symbols are handed out in small chunks rather than pre-split into
+    # n_workers equal blocks: per-symbol cost varies a lot (history length,
+    # number of surviving hits), so a static split leaves workers idle while
+    # the slowest block finishes. Small chunks keep every worker busy until
+    # the end while still amortising the pickling overhead. map() also
+    # returns results in input order, so the output is identical to the old
+    # serial loop's regardless of worker count.
+    chunksize = max(1, min(16, len(jobs) // (n_workers * 8)))
+    all_hits = []
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        for i, hits in enumerate(executor.map(_scan_symbol_worker, jobs, chunksize=chunksize), 1):
+            all_hits.extend(hits)
+            if i % 300 == 0:
+                print(f"  [{i}/{len(jobs)}] scanned, {len(all_hits)} hits so far")
 
     if not all_hits:
         print("No currently-active validated signals found.")

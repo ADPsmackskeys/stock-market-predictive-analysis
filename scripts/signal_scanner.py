@@ -75,6 +75,23 @@ DATA_SUFFIX     = "_data.csv"
 OUTPUT_FOLDER   = "results/signals_v2"
 Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
 
+# Point-in-time cutoff for walk-forward scans (--as-of). None = use every row
+# on disk, which is the normal production path.
+#
+# When set, run_symbol() drops every row after this date BEFORE any forward
+# window, indicator or signal is touched, and load_benchmark_forward_returns()
+# truncates the index the same way. The effect is that a scan can only see
+# what was knowable on the cutoff date -- which is what makes its output
+# usable as the signal vocabulary and statistics for a backtest that starts
+# after it. Without this, every number here is fitted over the whole file, so
+# a backtest built on it is reading its own answers back.
+#
+# Assigned by main() from --as-of BEFORE the ProcessPoolExecutor is created,
+# so forked workers inherit it via copy-on-write -- the same mechanism
+# COMPUTE_FISHER and _BENCHMARK_FWD_CACHE already rely on. It must therefore
+# never be changed once the pool exists.
+AS_OF: Optional[pd.Timestamp] = None
+
 # Must match fetch_technical_data.py's BENCHMARK_SYMBOL -- this is the
 # on-disk symbol name for the market index used for excess-return (market-
 # relative) scoring, not a stock to be scanned for signals itself (see
@@ -579,6 +596,16 @@ def load_benchmark_forward_returns() -> Optional[pd.DataFrame]:
         return None
     if bdf.empty or "Close" not in bdf.columns:
         return None
+
+    # Truncate the benchmark on the same cutoff as the stocks, BEFORE the
+    # shifts below. Without this a stock row dated a week before the cutoff
+    # would be scored against a Bench_Fwd_Close_30D built from index data
+    # three weeks past it. Small window, real leak -- and it feeds EV_Excess,
+    # which is the column used to argue an edge is not just market beta.
+    if AS_OF is not None:
+        bdf = bdf[bdf["Date"] <= AS_OF].reset_index(drop=True)
+        if bdf.empty:
+            return None
 
     for h in ALL_HORIZONS:
         bdf[f"Bench_Fwd_Close_{h}D"] = bdf["Close"].shift(-h) / bdf["Close"] - 1
@@ -1317,6 +1344,13 @@ def run_symbol(filepath: str, test_triples: bool = False,
         if VERBOSE: print(f"[SKIP] {filepath}: {e}")
         return None
 
+    # Point-in-time truncation, before anything derived from the prices
+    # exists. Above the length check on purpose: a symbol with 1400 rows on
+    # disk but only 60 before the cutoff must be skipped as too short, not
+    # scored on 60 rows and then ranked beside symbols that had 700.
+    if AS_OF is not None:
+        df = df[df["Date"] <= AS_OF].reset_index(drop=True)
+
     if len(df) < 100:
         if VERBOSE: print(f"[SKIP] Too few rows ({len(df)}) in {filepath}")
         return None
@@ -1605,11 +1639,46 @@ def main():
                               "into each rewritten per-symbol CSV rather than deleted -- they keep "
                               "their older ScoredThrough date, and the cross-symbol leaderboard is "
                               "built from this run's fresh rows only.")
+    parser.add_argument("--as-of", type=str, default=None, metavar="YYYY-MM-DD",
+                         help="Point-in-time scan: ignore every row after this date, for the "
+                              "stocks and the benchmark index alike. Use it to produce the signal "
+                              "vocabulary and statistics for a backtest beginning after the "
+                              "cutoff -- a scan without it is fitted over the whole file and "
+                              "cannot honestly score any period inside it. Pair with "
+                              "--output-folder.")
+    parser.add_argument("--output-folder", type=str, default=None, metavar="DIR",
+                         help="Write the per-symbol signal CSVs here instead of the default "
+                              "results/signals_v2. Effectively required with --as-of: the default "
+                              "folder is what live_signal_scan.py reads, and a truncated scan "
+                              "written there would quietly replace every live track record with a "
+                              "short-history one.")
     args = parser.parse_args()
 
-    global COMPUTE_FISHER
+    global COMPUTE_FISHER, AS_OF, OUTPUT_FOLDER
     if args.no_fisher:
         COMPUTE_FISHER = False
+
+    # AS_OF and OUTPUT_FOLDER are both read by run_symbol() inside the worker
+    # processes, so they have to be assigned here -- before the
+    # ProcessPoolExecutor below forks -- rather than threaded through job_args.
+    # See the AS_OF comment at the top of this file.
+    if args.as_of:
+        try:
+            AS_OF = pd.Timestamp(args.as_of)
+        except ValueError:
+            print(f"[ERROR] --as-of {args.as_of!r} is not a parseable date (want YYYY-MM-DD)")
+            return
+    if args.output_folder:
+        OUTPUT_FOLDER = args.output_folder
+        Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
+
+    if AS_OF is not None:
+        print(f"Point-in-time scan: every row after {AS_OF.date()} ignored.")
+        print(f"Writing to: {OUTPUT_FOLDER}")
+        if not args.output_folder:
+            print(f"[WARNING] --as-of without --output-folder -- this run will overwrite "
+                  f"{OUTPUT_FOLDER}, which live_signal_scan.py reads.")
+        print()
 
     exclude_concentrated    = not args.keep_concentrated
     exclude_regime_untested = not args.keep_regime_untested
