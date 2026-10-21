@@ -1,12 +1,12 @@
 """
-Backtest: buy every fresh bullish signal, exit at the first target still ahead
-of the entry price.
+Backtest fresh bullish signals with independent T1, T2, and T3 target strategies.
+Each strategy uses the same signal, next-session-open entry, and holding horizon.
 
 WHAT THIS ANSWERS
 -----------------
-"If I had bought the top 30 stocks whose signals fired each session since
-January 2024, entering at the next open and selling at T1, what would I have
-made?"
+"If I had bought the top N bullish stocks whose signals fired each session,
+entering at the next open and independently targeting T1, T2, or T3, what would
+I have made?"
 
 WHY IT IS NOT A LOOP OVER live_signal_scan.py
 ---------------------------------------------
@@ -51,13 +51,11 @@ measured from. Re-anchoring to the entry price would change what the quantile
 means.
 
 Those two facts together create the case this script handles explicitly: the
-open can gap ABOVE a target that is anchored to the previous close. Aiming at a
-level already behind you is not a trade, so the target cascades to the first
-rung still above the entry -- T1, else T2, else T3. If the open has cleared all
-three, there is nothing left to aim at and the trade is recorded as
-`no_target_above_entry` rather than given a synthetic target. TargetUsed says
-which rung each trade actually aimed at, and returns are NOT comparable across
-rungs, so always group by it.
+open can gap ABOVE a target that is anchored to the previous close. Each target
+strategy is evaluated independently. T1 aims only at T1, T2 only at T2, and T3
+only at T3. If a strategy's target is already at or below the entry, that
+strategy records `no_target_above_entry` rather than inventing a trade. The
+three strategies share the same signals, entry prices, and holding horizons.
 
 A target is a resting limit order: it fills the moment the session trades at
 the level, whether or not price closed beyond it (see get_target_hit_date in
@@ -121,84 +119,105 @@ def since_index_all(combined: np.ndarray) -> np.ndarray:
     return np.maximum.accumulate(np.where(~combined, idx, -1)) + 1
 
 
-def resolve_trade(opens, highs, closes, segments, n,
-                  s: int, best_h: int, target_pcts, signal_close: float) -> dict:
-    """Simulate one position: enter at row s+1's open, aim at the first ladder
-    rung still above that entry, exit on the first touch or at the window's
-    final close.
+def resolve_trade_target(opens, highs, closes, segments, n,
+                         s: int, best_h: int, target_pct,
+                         target_num: int, signal_close: float) -> dict:
+    """Simulate one target-specific strategy for one signal.
 
-    `s` is the firing bar. Returns a dict of the resolved trade, always
-    including an Outcome -- an unresolvable trade is labelled, never dropped
-    silently, so the ledger's row count always matches the candidate count.
+    All target strategies enter at the open of row s+1 and use the same
+    BestHorizon. The only difference between T1, T2, and T3 is the target rung.
+    A target at or below the entry price is unavailable for that strategy.
     """
     e = s + 1
     if e > n - 1:
         return {"Outcome": OUT_NO_ENTRY_BAR}
 
     entry = opens[e]
-    if not np.isfinite(entry) or entry <= 0 or not np.isfinite(signal_close) or signal_close <= 0:
+    if (not np.isfinite(entry) or entry <= 0
+            or not np.isfinite(signal_close) or signal_close <= 0):
         return {"Outcome": OUT_NO_ENTRY_BAR}
 
-    # Ladder in price space, anchored to the FIRING bar's close (not the entry
-    # price -- see module docstring). Sorted rather than assumed ascending:
-    # P10 <= P20 <= P30 holds by construction in signal_scanner.py, but a
-    # degenerate distribution can make two rungs equal and a hand-edited
-    # signals file could make them out of order.
-    rungs = []
-    for i, pct in enumerate(target_pcts, start=1):
-        if pd.isna(pct):
-            continue
-        rungs.append((i, float(pct), float(signal_close) * (1.0 + float(pct))))
-    rungs.sort(key=lambda r: r[2])
-
-    # The cascade: first rung strictly above the entry. `>` not `>=` because a
-    # level exactly at the entry price is already satisfied and would book a
-    # guaranteed zero-return "win".
-    ahead = [r for r in rungs if r[2] > entry]
     gap_pct = entry / float(signal_close) - 1.0
-    if not ahead:
-        return {"Outcome": OUT_NO_TARGET, "Entry": entry, "GapPct": gap_pct,
-                "TargetUsed": np.nan, "TargetLevel": np.nan}
 
-    tgt_num, tgt_pct, level = ahead[0]
+    # The target ladder is anchored to the signal bar's close, not the entry.
+    if pd.isna(target_pct):
+        return {
+            "Outcome": OUT_NO_TARGET,
+            "Entry": float(entry),
+            "GapPct": gap_pct,
+            "TargetUsed": target_num,
+            "TargetPct": np.nan,
+            "TargetLevel": np.nan,
+        }
 
-    # Window end: the horizon measured from the firing bar, clipped to the data
-    # we actually have. `truncated` distinguishes "the target was never reached
-    # in 30 sessions" from "we have not seen 30 sessions yet", which are
-    # completely different facts and must not share an outcome label.
+    target_pct = float(target_pct)
+    level = float(signal_close) * (1.0 + target_pct)
+
+    # A target already at or below entry is not a valid target for this strategy.
+    if not np.isfinite(level) or level <= entry:
+        return {
+            "Outcome": OUT_NO_TARGET,
+            "Entry": float(entry),
+            "GapPct": gap_pct,
+            "TargetUsed": target_num,
+            "TargetPct": target_pct,
+            "TargetLevel": level,
+        }
+
+    # Holding window is rows s+1 .. s+BestHorizon, clipped to available data.
     w_end_ideal = s + int(best_h)
     w_end = min(n - 1, w_end_ideal)
     truncated = w_end_ideal > n - 1
 
-    seg_crossed = bool(segments is not None and segments[e] != segments[w_end])
+    seg_crossed = bool(
+        segments is not None and segments[e] != segments[w_end]
+    )
 
     base = {
-        "Entry": entry, "GapPct": gap_pct,
-        "TargetUsed": tgt_num, "TargetPct": tgt_pct, "TargetLevel": level,
-        "WindowEndRow": w_end, "SegmentCrossed": seg_crossed,
+        "Entry": float(entry),
+        "GapPct": gap_pct,
+        "TargetUsed": target_num,
+        "TargetPct": target_pct,
+        "TargetLevel": level,
+        "WindowEndRow": w_end,
+        "SegmentCrossed": seg_crossed,
     }
 
     hits = np.flatnonzero(highs[e:w_end + 1] >= level)
     if hits.size:
         r = e + int(hits[0])
-        # Gapped clean through the level -> the resting order fills at the open,
-        # which is strictly better than the level. Filling at `level` here would
-        # understate the return on exactly the trades that went best.
+        # If the market opens above the target, model the fill at that open.
         fill = opens[r] if (np.isfinite(opens[r]) and opens[r] > level) else level
-        return {**base, "Outcome": OUT_TARGET_HIT, "ExitRow": r, "ExitPrice": float(fill),
-                "SessionsHeld": r - e, "Return": float(fill) / entry - 1.0}
+        return {
+            **base,
+            "Outcome": OUT_TARGET_HIT,
+            "ExitRow": r,
+            "ExitPrice": float(fill),
+            "SessionsHeld": r - e,
+            "Return": float(fill) / entry - 1.0,
+        }
 
     if truncated:
-        # Unresolved, not a loss: mark to market so it is visible, but the
-        # summary must exclude these or every recent signal reads as a failure.
+        # The target was not reached, and the full horizon is not yet available.
         mtm = closes[w_end]
-        return {**base, "Outcome": OUT_STILL_OPEN, "ExitRow": w_end,
-                "ExitPrice": float(mtm), "SessionsHeld": w_end - e,
-                "Return": float(mtm) / entry - 1.0}
+        return {
+            **base,
+            "Outcome": OUT_STILL_OPEN,
+            "ExitRow": w_end,
+            "ExitPrice": float(mtm),
+            "SessionsHeld": w_end - e,
+            "Return": float(mtm) / entry - 1.0,
+        }
 
     exit_px = closes[w_end]
-    return {**base, "Outcome": OUT_HORIZON, "ExitRow": w_end, "ExitPrice": float(exit_px),
-            "SessionsHeld": w_end - e, "Return": float(exit_px) / entry - 1.0}
+    return {
+        **base,
+        "Outcome": OUT_HORIZON,
+        "ExitRow": w_end,
+        "ExitPrice": float(exit_px),
+        "SessionsHeld": w_end - e,
+        "Return": float(exit_px) / entry - 1.0,
+    }
 
 
 def scan_symbol_episodes(job: tuple) -> list:
@@ -223,7 +242,10 @@ def scan_symbol_episodes(job: tuple) -> list:
     if len(df) < 60 or scored.empty:
         return []
 
-    scored = scored[scored["Direction"] == "Bullish"]
+    # Normalize case/whitespace so only explicitly bullish rows are eligible.
+    scored = scored[
+        scored["Direction"].astype(str).str.strip().str.casefold() == "bullish"
+    ]
     if scored.empty:
         return []
 
@@ -289,17 +311,43 @@ def scan_symbol_episodes(job: tuple) -> list:
             prev = best_per_row.get(s)
             if prev is not None and prev[0] >= composite:
                 continue
-            trade = resolve_trade(opens, highs, closes, segments, n,
-                                  s, best_h, tpcts, closes[s])
+            # Resolve three independent target strategies. All use the same
+            # signal, entry open, and BestHorizon; only the target rung differs.
+            strategy_results = {}
+            for target_num, target_pct in enumerate(tpcts, start=1):
+                result = resolve_trade_target(
+                    opens, highs, closes, segments, n,
+                    s, best_h, target_pct, target_num, closes[s]
+                )
+                result["EntryDate"] = (
+                    dates[s + 1] if s + 1 < n else np.datetime64("NaT")
+                )
+                result["ExitDate"] = (
+                    dates[result["ExitRow"]]
+                    if "ExitRow" in result else np.datetime64("NaT")
+                )
+                strategy_results[target_num] = result
+
+            # Keep the existing generic trade columns mapped to T1, so the
+            # existing CSV/statistics/log workflow now represents the T1 strategy.
+            trade = dict(strategy_results[1])
             trade.update({
-                "Symbol": row["Symbol"], "SignalName": row["SignalName"],
-                "SignalDate": dates[s], "SignalClose": float(closes[s]),
-                "BestHorizon": best_h, "CompositeScore": float(composite),
+                "Symbol": row["Symbol"],
+                "SignalName": row["SignalName"],
+                "Direction": str(row.get("Direction", "")),
+                "SignalDate": dates[s],
+                "SignalClose": float(closes[s]),
+                "BestHorizon": best_h,
+                "CompositeScore": float(composite),
                 "Count": row["Count"],
-                "EntryDate": dates[s + 1] if s + 1 < n else np.datetime64("NaT"),
-                "ExitDate": (dates[trade["ExitRow"]] if "ExitRow" in trade
-                             else np.datetime64("NaT")),
             })
+
+            # Persist all strategy-specific outcomes in the candidate cache so
+            # T2/T3 can be selected without rescanning the price history.
+            for target_num, result in strategy_results.items():
+                for key, value in result.items():
+                    trade[f"T{target_num}_{key}"] = value
+
             best_per_row[s] = (composite, trade)
 
     return [t for _, t in best_per_row.values()]
@@ -329,11 +377,11 @@ def headline_stats(sel: pd.DataFrame) -> dict:
     }
 
 
-def comparison_table(rows: list) -> None:
+def comparison_table(rows: list, target_label: str = "T1") -> None:
     """One line per portfolio size. This is the headline of a sweep -- the
     per-size detail below it is the same data broken out."""
     print("\n" + "=" * 84)
-    print("COMPARISON ACROSS PORTFOLIO SIZES")
+    print(f"COMPARISON ACROSS PORTFOLIO SIZES — {target_label} STRATEGY")
     print("=" * 84)
     print(f"\n{'N':>4} {'trades':>9} {'resolved':>9} {'reached':>8} "
           f"{'mean':>9} {'median':>9} {'std':>8} {'total':>11} {'sess':>6} {'syms':>6}")
@@ -351,11 +399,10 @@ def comparison_table(rows: list) -> None:
     print("trade count, so compare 'mean' across sizes, not 'total'.")
 
 
-def summarise(sel: pd.DataFrame, top_n: int) -> None:
-    """Print the headline numbers, split by the facts that make returns
-    non-comparable: which rung was aimed at, and whether the trade resolved."""
+def summarise(sel: pd.DataFrame, top_n: int, target_label: str = "T1") -> None:
+    """Print headline results for one target strategy and portfolio size."""
     print("\n" + "=" * 72)
-    print(f"RESULTS — top {top_n} stocks per session, exit at first target above entry")
+    print(f"RESULTS — top {top_n} stocks per session, dedicated {target_label} target strategy")
     print("=" * 72)
 
     print(f"\nTrades: {len(sel):,}  "
@@ -389,11 +436,8 @@ def summarise(sel: pd.DataFrame, top_n: int) -> None:
     print(f"  sum of returns (1 unit each): {r.sum()*100:+.1f}% "
           f"over {len(res):,} trades")
 
-    print("\nBy target rung aimed at (returns are NOT comparable across rungs):")
-    for t, g in res.groupby("TargetUsed"):
-        h = (g["Outcome"] == OUT_TARGET_HIT).mean()
-        print(f"  T{int(t)}: {len(g):>7,} trades | reached {h*100:5.1f}% | "
-              f"mean {g['Return'].mean()*100:+.3f}% | median {g['Return'].median()*100:+.3f}%")
+    # This summary is already for one dedicated target strategy, so all
+    # resolved trades in this section target the same rung.
 
     print("\nMean overnight gap (entry open vs firing close):")
     print(f"  {res['GapPct'].mean()*100:+.3f}%  "
@@ -416,10 +460,191 @@ def summarise(sel: pd.DataFrame, top_n: int) -> None:
               f"mean {g['Return'].mean()*100:+.3f}% | total {g['Return'].sum()*100:+.1f}%")
 
 
+
+def export_trader_log(sel: pd.DataFrame, top_n: int, target_label: str = "T1") -> None:
+    """Export a trader-friendly ENTRY/EXIT log to TXT and Excel.
+
+    ENTRY rows are created for trades that were actually entered.
+    EXIT rows are created only for resolved trades. Unresolved trades
+    are shown as OPEN entries without a synthetic exit.
+    """
+    os.makedirs("results", exist_ok=True)
+
+    resolved_outcomes = [OUT_TARGET_HIT, OUT_HORIZON]
+    entered_outcomes = resolved_outcomes + [OUT_STILL_OPEN]
+
+    entered = sel[sel["Outcome"].isin(entered_outcomes)].copy()
+    events = []
+
+    for _, trade in entered.iterrows():
+        if pd.isna(trade.get("Entry")) or pd.isna(trade.get("EntryDate")):
+            continue
+
+        symbol = trade["Symbol"]
+        signal_date = pd.to_datetime(trade["SignalDate"])
+        entry_date = pd.to_datetime(trade["EntryDate"])
+        outcome = trade["Outcome"]
+
+        # Match the ENTRY and EXIT events for the same backtest trade.
+        trade_id = f"{symbol}_{signal_date.strftime('%Y%m%d')}"
+
+        # ENTRY EVENT
+        events.append({
+            "Date": entry_date,
+            "Symbol": symbol,
+            "Trade Type": "ENTRY",
+            "LTP/CMP": float(trade["Entry"]),
+            "Gain/Loss %": np.nan,
+            "Days Taken": np.nan,
+            "Status": "OPEN" if outcome == OUT_STILL_OPEN else "CLOSED",
+            "Trade ID": trade_id,
+        })
+
+        # EXIT EVENT: only resolved trades get an exit row.
+        if outcome in resolved_outcomes:
+            exit_date = trade.get("ExitDate")
+            exit_price = trade.get("ExitPrice")
+            trade_return = trade.get("Return")
+            sessions_held = trade.get("SessionsHeld")
+
+            if (
+                pd.isna(exit_date)
+                or pd.isna(exit_price)
+                or pd.isna(trade_return)
+                or pd.isna(sessions_held)
+            ):
+                continue
+
+            events.append({
+                "Date": pd.to_datetime(exit_date),
+                "Symbol": symbol,
+                "Trade Type": "EXIT",
+                "LTP/CMP": float(exit_price),
+                # Return is stored as a decimal: 0.05 means +5%.
+                "Gain/Loss %": float(trade_return),
+                # SessionsHeld counts trading sessions in this backtest.
+                "Days Taken": int(sessions_held),
+                "Status": outcome,
+                "Trade ID": trade_id,
+            })
+
+    columns = [
+        "Date",
+        "Symbol",
+        "Trade Type",
+        "LTP/CMP",
+        "Gain/Loss %",
+        "Days Taken",
+        "Status",
+        "Trade ID",
+    ]
+    log = pd.DataFrame(events, columns=columns)
+
+    if not log.empty:
+        # Entries appear before exits when dates are identical.
+        log["_event_order"] = log["Trade Type"].map({"ENTRY": 0, "EXIT": 1})
+        log = (
+            log.sort_values(
+                ["Date", "Symbol", "_event_order", "Trade ID"],
+                kind="stable",
+            )
+            .drop(columns="_event_order")
+            .reset_index(drop=True)
+        )
+        log["Date"] = pd.to_datetime(log["Date"])
+
+    # OUTPUT 1: TEXT FILE
+    suffix = "" if target_label == "T1" else f"_{target_label.lower()}"
+    txt_path = f"results/trader_trades{suffix}_top{top_n}.txt"
+    text_log = log.copy()
+    if not text_log.empty:
+        text_log["Date"] = text_log["Date"].dt.strftime("%Y-%m-%d")
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(f"TRADER TRADE LOG - {target_label} STRATEGY - TOP {top_n} STOCKS PER SESSION\n")
+        f.write("=" * 105 + "\n\n")
+        f.write("Gain/Loss % is populated only on EXIT rows.\n")
+        f.write("Days Taken counts trading sessions, not calendar days.\n")
+        f.write("OPEN means the trade has no resolved exit yet.\n\n")
+
+        if text_log.empty:
+            f.write("No entered trades found.\n")
+        else:
+            f.write(
+                text_log.to_string(
+                    index=False,
+                    formatters={
+                        "LTP/CMP": lambda x: "" if pd.isna(x) else f"{x:,.2f}",
+                        "Gain/Loss %": lambda x: (
+                            "" if pd.isna(x) else f"{x * 100:+.2f}%"
+                        ),
+                        "Days Taken": lambda x: (
+                            "" if pd.isna(x) else str(int(x))
+                        ),
+                    },
+                )
+            )
+            f.write("\n")
+
+    # OUTPUT 2: EXCEL FILE
+    xlsx_path = f"results/trader_trades{suffix}_top{top_n}.xlsx"
+    with pd.ExcelWriter(
+        xlsx_path,
+        engine="openpyxl",
+        date_format="yyyy-mm-dd",
+        datetime_format="yyyy-mm-dd",
+    ) as writer:
+        log.to_excel(writer, sheet_name="Trade Log", index=False)
+        ws = writer.sheets["Trade Log"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        widths = {
+            "A": 14,  # Date
+            "B": 18,  # Symbol
+            "C": 14,  # Trade Type
+            "D": 16,  # LTP/CMP
+            "E": 16,  # Gain/Loss %
+            "F": 14,  # Days Taken
+            "G": 20,  # Status
+            "H": 28,  # Trade ID
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+
+        for row in range(2, ws.max_row + 1):
+            ws.cell(row=row, column=1).number_format = "yyyy-mm-dd"
+            ws.cell(row=row, column=4).number_format = "#,##0.00"
+            ws.cell(row=row, column=5).number_format = "+0.00%;-0.00%;0.00%"
+            ws.cell(row=row, column=6).number_format = "0"
+
+    print(f"  Trader log -> {txt_path}")
+    print(f"  Trader log -> {xlsx_path}")
+
+
+def strategy_view(sel: pd.DataFrame, target_num: int) -> pd.DataFrame:
+    """Return a view of candidates with generic trade fields for T1, T2, or T3."""
+    out = sel.copy()
+    prefix = f"T{target_num}_"
+    fields = [
+        "Outcome", "Entry", "GapPct", "TargetUsed", "TargetPct",
+        "TargetLevel", "WindowEndRow", "SegmentCrossed", "ExitRow",
+        "ExitPrice", "SessionsHeld", "Return", "EntryDate", "ExitDate",
+    ]
+    missing = [field for field in fields if f"{prefix}{field}" not in out.columns]
+    if missing:
+        raise ValueError(
+            f"Candidate cache is missing {prefix} strategy fields: {missing}. "
+            "Rerun without --reuse-candidates to rebuild the cache."
+        )
+    for field in fields:
+        out[field] = out[f"{prefix}{field}"]
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Backtest buying fresh bullish signals and exiting at the first "
-                    "target above the entry price.")
+        description="Backtest fresh bullish signals with independent T1, T2, and T3 targets.")
     ap.add_argument("--start", default="2024-01-01", help="First tradeable signal date.")
     ap.add_argument("--top-n", type=int, nargs="+", default=None, metavar="N",
                     help=f"Stocks per session, ranked by CompositeScore. One position per "
@@ -453,6 +678,16 @@ def main():
                      f"--reuse-candidates first.")
         cand = pd.read_parquet(CANDIDATES_FILE)
         print(f"Reusing {len(cand):,} candidates from {CANDIDATES_FILE}")
+        required_cache_columns = {
+            "Direction", "T1_Outcome", "T2_Outcome", "T3_Outcome"
+        }
+        missing_cache_columns = required_cache_columns.difference(cand.columns)
+        if missing_cache_columns:
+            sys.exit(
+                f"[ERROR] {CANDIDATES_FILE} was created by an older script and "
+                f"is missing {sorted(missing_cache_columns)}. Run once without "
+                "--reuse-candidates to rebuild it."
+            )
     else:
         filters = {
             "max_ev_median_gap": args.max_ev_median_gap,
@@ -491,10 +726,19 @@ def main():
 
     # Selection. The worker already reduced to one row per (symbol, session),
     # so this is purely "the top N stocks that session".
-    #
-    # Ranked once with a single groupby rather than once per size: every size
-    # is a prefix of the same ranking, so RankInSession <= n is all a size
-    # needs, and it lands in the output CSV as a useful column besides.
+    # Ranking is shared by all target strategies.
+    if "Direction" not in cand.columns:
+        sys.exit(
+            "[ERROR] Candidate data has no Direction column, so bullish-only "
+            "trading cannot be guaranteed. Run without --reuse-candidates."
+        )
+
+    cand = cand[
+        cand["Direction"].astype(str).str.strip().str.casefold() == "bullish"
+    ].copy()
+    if cand.empty:
+        sys.exit("[ERROR] No bullish candidate episodes found in range.")
+
     cand = cand.sort_values(["SignalDate", "CompositeScore"], ascending=[True, False])
     cand["RankInSession"] = cand.groupby("SignalDate").cumcount() + 1
 
@@ -502,19 +746,36 @@ def main():
     if any(n < 1 for n in top_ns):
         sys.exit(f"[ERROR] --top-n values must be >= 1, got {top_ns}")
 
-    rows = []
-    for n in top_ns:
-        sel = cand[cand["RankInSession"] <= n].copy()
-        path = TRADES_FILE_TMPL.format(n=n)
-        sel.to_csv(path, index=False)
-        print(f"  top {n:>3}/session: {len(sel):>7,} trades -> {path}")
-        rows.append((n, headline_stats(sel)))
+    # One comparison table per dedicated target strategy.
+    for target_num in (1, 2, 3):
+        target_label = f"T{target_num}"
+        rows = []
 
-    comparison_table(rows)
-
-    if args.detail or len(top_ns) == 1:
         for n in top_ns:
-            summarise(cand[cand["RankInSession"] <= n].copy(), n)
+            selected = cand[cand["RankInSession"] <= n].copy()
+            sel = strategy_view(selected, target_num)
+
+            # Keep the original filenames for T1. T2 and T3 get separate files.
+            if target_num == 1:
+                csv_path = TRADES_FILE_TMPL.format(n=n)
+            else:
+                csv_path = f"results/backtest_t{target_num}_trades_top{n}.csv"
+
+            sel.to_csv(csv_path, index=False)
+            print(
+                f"  {target_label} top {n:>3}/session: {len(sel):>7,} "
+                f"trades -> {csv_path}"
+            )
+
+            export_trader_log(sel, n, target_label=target_label)
+            rows.append((n, headline_stats(sel)))
+
+        comparison_table(rows, target_label=target_label)
+
+        if args.detail or len(top_ns) == 1:
+            for n in top_ns:
+                selected = cand[cand["RankInSession"] <= n].copy()
+                summarise(strategy_view(selected, target_num), n, target_label=target_label)
 
     print(f"\nRe-run with --reuse-candidates to re-select without rescanning "
           f"({len(cand):,} candidates cached).")
