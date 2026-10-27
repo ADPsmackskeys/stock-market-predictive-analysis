@@ -1,6 +1,8 @@
 """
-Backtest fresh bullish signals with independent T1, T2, and T3 target strategies.
-Each strategy uses the same signal, next-session-open entry, and holding horizon.
+Backtest fresh bullish signals with independent fixed T1/T2/T3 baselines and a
+simple dynamic position experiment. Dynamic positions buy ~10,000 per entry; a
+fresh signal with a strictly higher CompositeScore adds another ~10,000, updates
+the target, and may extend the horizon. All accumulated shares sell together.
 
 WHAT THIS ANSWERS
 -----------------
@@ -333,6 +335,10 @@ def scan_symbol_episodes(job: tuple) -> list:
             trade = dict(strategy_results[1])
             trade.update({
                 "Symbol": row["Symbol"],
+                # Canonical ticker comes from the actual technical-data filename.
+                # SignalRow lets the position simulator access the exact price bar.
+                "TechSymbol": os.path.basename(tech_path).replace(ss.DATA_SUFFIX, ""),
+                "SignalRow": int(s),
                 "SignalName": row["SignalName"],
                 "Direction": str(row.get("Direction", "")),
                 "SignalDate": dates[s],
@@ -642,6 +648,358 @@ def strategy_view(sel: pd.DataFrame, target_num: int) -> pd.DataFrame:
     return out
 
 
+
+DYNAMIC_BUDGET_PER_BUY = 10_000
+
+
+def _shares_for_budget(price: float) -> int:
+    """Buy approximately ₹10,000 worth, rounded to whole shares (minimum one)."""
+    if not np.isfinite(price) or price <= 0:
+        return 0
+    return max(1, int(np.floor(DYNAMIC_BUDGET_PER_BUY / price + 0.5)))
+
+
+def _date_at(prices: pd.DataFrame, row_index: int):
+    if 0 <= int(row_index) < len(prices):
+        return pd.Timestamp(prices.iloc[int(row_index)]["Date"])
+    return pd.NaT
+
+
+def _close_dynamic_position(position: dict, symbol: str, date, row_index: int,
+                            price: float, reason: str, trades: list,
+                            transactions: list):
+    """Sell every share accumulated in a position and record the round trip."""
+    shares = int(position["Shares"])
+    proceeds = shares * float(price)
+    pnl = proceeds - float(position["TotalCost"])
+    invested = float(position["TotalCost"])
+    ret = pnl / invested if invested else np.nan
+
+    trades.append({
+        "Symbol": symbol,
+        "Status": reason,
+        "InitialSignalDate": position["InitialSignalDate"],
+        "EntryDate": position["EntryDate"],
+        "ExitDate": pd.Timestamp(date),
+        "InitialCompositeScore": position["InitialScore"],
+        "FinalCompositeScore": position["GoverningScore"],
+        "BuyCount": position["BuyCount"],
+        "SharesBought": shares,
+        "AverageBuyPrice": invested / shares if shares else np.nan,
+        "TotalInvested": invested,
+        "ExitPrice": float(price),
+        "TotalProceeds": proceeds,
+        "PnL": pnl,
+        "Return": ret,
+        "InitialTarget": position["InitialTarget"],
+        "FinalTarget": position["TargetPrice"],
+        "InitialHorizonEndDate": position["InitialHorizonEndDate"],
+        "FinalHorizonEndDate": position["HorizonEndDate"],
+        "TargetUpdates": position["TargetUpdates"],
+        "FinalSignalDate": position["GoverningSignalDate"],
+    })
+    transactions.append({
+        "Date": pd.Timestamp(date),
+        "Symbol": symbol,
+        "Action": "SELL_ALL",
+        "SignalDate": position["GoverningSignalDate"],
+        "CompositeScore": position["GoverningScore"],
+        "Price": float(price),
+        "Shares": shares,
+        "BuyAmount": np.nan,
+        "CumulativeShares": 0,
+        "CumulativeInvested": invested,
+        "TargetBefore": position["TargetPrice"],
+        "TargetAfter": position["TargetPrice"],
+        "HorizonBefore": position["HorizonEndDate"],
+        "HorizonAfter": position["HorizonEndDate"],
+        "Reason": reason,
+        "PnL": pnl,
+        "Return": ret,
+    })
+
+
+def simulate_dynamic_symbol(symbol: str, prices: pd.DataFrame,
+                            signals: pd.DataFrame, target_num: int,
+                            top_n: int) -> tuple[list, list]:
+    """Simulate one stock's position, adding ~₹10,000 only on stronger signals.
+
+    Signals are known after their signal-day close. New buys/adds execute at the
+    next session's open. An accepted stronger signal replaces the target and can
+    extend the horizon to the newer signal's horizon, but does not shorten it.
+    Existing shares and added shares are sold together on target/horizon exit.
+    """
+    trades: list = []
+    transactions: list = []
+    if prices.empty or signals.empty:
+        return trades, transactions
+
+    prices = prices.sort_values("Date").reset_index(drop=True)
+    prices["Date"] = pd.to_datetime(prices["Date"])
+    n_rows = len(prices)
+    opens = pd.to_numeric(prices["Open"], errors="coerce").to_numpy(dtype=float)
+    highs = pd.to_numeric(prices["High"], errors="coerce").to_numpy(dtype=float)
+    closes = pd.to_numeric(prices["Close"], errors="coerce").to_numpy(dtype=float)
+
+    target_col = f"T{target_num}_TargetPct"
+    if target_col not in signals.columns:
+        return trades, transactions
+
+    by_row = {}
+    for _, signal in signals.sort_values("SignalRow").iterrows():
+        try:
+            r = int(signal["SignalRow"])
+        except (TypeError, ValueError):
+            continue
+        if 0 <= r < n_rows:
+            # Candidate scan already keeps only the highest-scoring signal per
+            # stock/session, so there can be only one signal event per row here.
+            by_row[r] = signal
+
+    if not by_row:
+        return trades, transactions
+
+    position = None
+    pending_order = None
+    first_signal_row = min(by_row)
+
+    for r in range(first_signal_row, n_rows):
+        date = pd.Timestamp(prices.iloc[r]["Date"])
+        open_price = opens[r]
+        high_price = highs[r]
+        close_price = closes[r]
+
+        # 1) Execute the previous close's buy/add at today's open.
+        if pending_order is not None and np.isfinite(open_price) and open_price > 0:
+            order = pending_order
+            qty = _shares_for_budget(float(open_price))
+            amount = qty * float(open_price)
+            if order["Action"] == "BUY":
+                pos = {
+                    "EntryDate": date,
+                    "InitialSignalDate": order["SignalDate"],
+                    "InitialScore": order["CompositeScore"],
+                    "GoverningScore": order["CompositeScore"],
+                    "GoverningSignalDate": order["SignalDate"],
+                    "Shares": qty,
+                    "TotalCost": amount,
+                    "BuyCount": 1,
+                    "TargetPrice": order["TargetPrice"],
+                    "InitialTarget": order["TargetPrice"],
+                    "HorizonEndRow": order["HorizonEndRow"],
+                    "InitialHorizonEndDate": _date_at(prices, order["HorizonEndRow"]),
+                    "HorizonEndDate": _date_at(prices, order["HorizonEndRow"]),
+                    "TargetUpdates": 0,
+                }
+                position = pos
+                transactions.append({
+                    "Date": date, "Symbol": symbol, "Action": "BUY",
+                    "SignalDate": order["SignalDate"],
+                    "CompositeScore": order["CompositeScore"],
+                    "Price": float(open_price), "Shares": qty,
+                    "BuyAmount": amount, "CumulativeShares": qty,
+                    "CumulativeInvested": amount,
+                    "TargetBefore": np.nan, "TargetAfter": pos["TargetPrice"],
+                    "HorizonBefore": pd.NaT, "HorizonAfter": pos["HorizonEndDate"],
+                    "Reason": "top_n_signal", "PnL": np.nan, "Return": np.nan,
+                })
+            elif position is not None:
+                old_target = position["TargetPrice"]
+                old_horizon = position["HorizonEndDate"]
+                position["Shares"] += qty
+                position["TotalCost"] += amount
+                position["BuyCount"] += 1
+                position["TargetUpdates"] += 1
+                transactions.append({
+                    "Date": date, "Symbol": symbol,
+                    "Action": "ADD_BUY_TARGET_UPDATE",
+                    "SignalDate": order["SignalDate"],
+                    "CompositeScore": order["CompositeScore"],
+                    "Price": float(open_price), "Shares": qty,
+                    "BuyAmount": amount,
+                    "CumulativeShares": position["Shares"],
+                    "CumulativeInvested": position["TotalCost"],
+                    "TargetBefore": old_target, "TargetAfter": position["TargetPrice"],
+                    "HorizonBefore": old_horizon, "HorizonAfter": position["HorizonEndDate"],
+                    "Reason": "higher_composite_score", "PnL": np.nan, "Return": np.nan,
+                })
+        pending_order = None
+
+        # 2) Today's high can trigger the active target. Sell ALL shares bought.
+        # If the session gaps above the target, use the open as the fill.
+        if position is not None and np.isfinite(high_price) and high_price >= position["TargetPrice"]:
+            fill = float(open_price) if np.isfinite(open_price) and open_price > position["TargetPrice"] else float(position["TargetPrice"])
+            _close_dynamic_position(position, symbol, date, r, fill, "target_hit", trades, transactions)
+            position = None
+        # 3) If target was not hit, liquidate all shares at the horizon-end close.
+        elif position is not None and r >= position["HorizonEndRow"] and np.isfinite(close_price) and close_price > 0:
+            _close_dynamic_position(position, symbol, date, r, float(close_price), "horizon_close", trades, transactions)
+            position = None
+
+        # 4) Signal arrives at today's close. It can only affect the next session.
+        signal = by_row.get(r)
+        if signal is None or r + 1 >= n_rows:
+            continue
+        try:
+            score = float(signal["CompositeScore"])
+            best_h = int(signal["BestHorizon"])
+            pct = float(signal[target_col])
+            signal_close = float(closes[r])
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(score) or not np.isfinite(pct) or not np.isfinite(signal_close) or signal_close <= 0 or best_h < 1:
+            continue
+        proposed_target = signal_close * (1.0 + pct)
+        if not np.isfinite(proposed_target) or proposed_target <= 0:
+            continue
+        proposed_horizon_row = r + best_h
+
+        if position is not None:
+            # Strictly higher than the currently governing signal; after each
+            # accepted update, the governing score becomes this new score.
+            if score > position["GoverningScore"]:
+                previous_target = position["TargetPrice"]
+                previous_horizon_row = position["HorizonEndRow"]
+                position["TargetPrice"] = proposed_target
+                position["GoverningScore"] = score
+                position["GoverningSignalDate"] = date
+                # The requested experiment extends the expiry, never shortens it.
+                position["HorizonEndRow"] = max(previous_horizon_row, proposed_horizon_row)
+                position["HorizonEndDate"] = _date_at(prices, position["HorizonEndRow"])
+                pending_order = {
+                    "Action": "ADD",
+                    "SignalDate": date,
+                    "CompositeScore": score,
+                    "TargetPrice": proposed_target,
+                    "HorizonEndRow": position["HorizonEndRow"],
+                }
+                # Adjustment is visible immediately in the transaction log even
+                # though the additional purchase executes at the next open.
+                transactions.append({
+                    "Date": date, "Symbol": symbol,
+                    "Action": "TARGET_UPDATE_PENDING_ADD",
+                    "SignalDate": date, "CompositeScore": score,
+                    "Price": np.nan, "Shares": 0, "BuyAmount": np.nan,
+                    "CumulativeShares": position["Shares"],
+                    "CumulativeInvested": position["TotalCost"],
+                    "TargetBefore": previous_target, "TargetAfter": proposed_target,
+                    "HorizonBefore": _date_at(prices, previous_horizon_row),
+                    "HorizonAfter": position["HorizonEndDate"],
+                    "Reason": "higher_composite_score; add at next open",
+                    "PnL": np.nan, "Return": np.nan,
+                })
+            # Lower/equal-scoring signals are simply ignored: no extra buy.
+        else:
+            # Top-N constrains only brand-new positions, not additions to a
+            # position that is already open.
+            try:
+                rank = int(signal["RankInSession"])
+            except (KeyError, TypeError, ValueError):
+                rank = top_n + 1
+            if rank <= top_n:
+                pending_order = {
+                    "Action": "BUY",
+                    "SignalDate": date,
+                    "CompositeScore": score,
+                    "TargetPrice": proposed_target,
+                    "HorizonEndRow": proposed_horizon_row,
+                }
+
+    # End of available data: report any still-open inventory at the latest close.
+    if position is not None and n_rows:
+        mark_date = pd.Timestamp(prices.iloc[-1]["Date"])
+        mark_price = closes[-1]
+        shares = int(position["Shares"])
+        invested = float(position["TotalCost"])
+        market_value = shares * float(mark_price) if np.isfinite(mark_price) else np.nan
+        pnl = market_value - invested if np.isfinite(market_value) else np.nan
+        ret = pnl / invested if invested and np.isfinite(pnl) else np.nan
+        trades.append({
+            "Symbol": symbol, "Status": "still_open", "InitialSignalDate": position["InitialSignalDate"],
+            "EntryDate": position["EntryDate"], "ExitDate": pd.NaT,
+            "InitialCompositeScore": position["InitialScore"],
+            "FinalCompositeScore": position["GoverningScore"],
+            "BuyCount": position["BuyCount"], "SharesBought": shares,
+            "AverageBuyPrice": invested / shares if shares else np.nan,
+            "TotalInvested": invested, "ExitPrice": np.nan,
+            "TotalProceeds": np.nan, "PnL": pnl, "Return": ret,
+            "MarkDate": mark_date, "MarkPrice": mark_price,
+            "MarketValue": market_value,
+            "InitialTarget": position["InitialTarget"], "FinalTarget": position["TargetPrice"],
+            "InitialHorizonEndDate": position["InitialHorizonEndDate"],
+            "FinalHorizonEndDate": position["HorizonEndDate"],
+            "TargetUpdates": position["TargetUpdates"],
+            "FinalSignalDate": position["GoverningSignalDate"],
+        })
+    return trades, transactions
+
+
+DYNAMIC_TRADE_COLUMNS = [
+    "Symbol", "Status", "InitialSignalDate", "EntryDate", "ExitDate",
+    "InitialCompositeScore", "FinalCompositeScore", "BuyCount", "SharesBought",
+    "AverageBuyPrice", "TotalInvested", "ExitPrice", "TotalProceeds", "PnL",
+    "Return", "MarkDate", "MarkPrice", "MarketValue", "InitialTarget", "FinalTarget",
+    "InitialHorizonEndDate", "FinalHorizonEndDate", "TargetUpdates", "FinalSignalDate",
+]
+DYNAMIC_TRANSACTION_COLUMNS = [
+    "Date", "Symbol", "Action", "SignalDate", "CompositeScore", "Price", "Shares",
+    "BuyAmount", "CumulativeShares", "CumulativeInvested", "TargetBefore", "TargetAfter",
+    "HorizonBefore", "HorizonAfter", "Reason", "PnL", "Return",
+]
+
+
+def simulate_dynamic_strategy(candidates: pd.DataFrame, top_n: int, target_num: int,
+                              price_cache: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the dynamic position rules for every ticker in one portfolio-size test."""
+    all_trades = []
+    all_transactions = []
+    if candidates.empty:
+        return pd.DataFrame(columns=DYNAMIC_TRADE_COLUMNS), pd.DataFrame(columns=DYNAMIC_TRANSACTION_COLUMNS)
+
+    for symbol, group in candidates.groupby("TechSymbol", sort=False):
+        symbol = str(symbol)
+        if symbol not in price_cache:
+            tech_path = os.path.join(ss.INPUT_FOLDER, f"{symbol}{ss.DATA_SUFFIX}")
+            if not os.path.exists(tech_path):
+                print(f"  [WARN] Dynamic simulation skipped {symbol}: price file not found: {tech_path}")
+                price_cache[symbol] = None
+            else:
+                try:
+                    price_cache[symbol] = pd.read_csv(
+                        tech_path, usecols=["Date", "Open", "High", "Close"], parse_dates=["Date"]
+                    ).sort_values("Date").reset_index(drop=True)
+                except Exception as exc:
+                    print(f"  [WARN] Dynamic simulation skipped {symbol}: cannot read OHLC data ({exc})")
+                    price_cache[symbol] = None
+        prices = price_cache.get(symbol)
+        if prices is None or prices.empty:
+            continue
+        t, e = simulate_dynamic_symbol(symbol, prices, group, target_num, top_n)
+        all_trades.extend(t)
+        all_transactions.extend(e)
+
+    trades_df = pd.DataFrame(all_trades, columns=DYNAMIC_TRADE_COLUMNS)
+    transactions_df = pd.DataFrame(all_transactions, columns=DYNAMIC_TRANSACTION_COLUMNS)
+    if not trades_df.empty:
+        trades_df = trades_df.sort_values(["InitialSignalDate", "Symbol"], kind="stable")
+    if not transactions_df.empty:
+        transactions_df = transactions_df.sort_values(["Date", "Symbol"], kind="stable")
+    return trades_df, transactions_df
+
+
+def print_dynamic_summary(trades: pd.DataFrame, target_label: str, top_n: int):
+    """Small sanity summary so empty or zero-update runs are obvious."""
+    if trades.empty:
+        print(f"  DYNAMIC {target_label} top {top_n}: 0 positions; check candidate cache and ticker price files.")
+        return
+    closed = trades[trades["Status"].isin(["target_hit", "horizon_close"])]
+    open_count = int((trades["Status"] == "still_open").sum())
+    updates = int(pd.to_numeric(trades.get("TargetUpdates", 0), errors="coerce").fillna(0).sum()) if "TargetUpdates" in trades else 0
+    total_pnl = pd.to_numeric(closed.get("PnL", pd.Series(dtype=float)), errors="coerce").sum()
+    print(f"  DYNAMIC {target_label} top {top_n}: {len(trades):,} positions, "
+          f"{len(closed):,} closed, {open_count:,} still open, "
+          f"{updates:,} accepted target updates, realised PnL {total_pnl:+,.2f}")
+
 def main():
     ap = argparse.ArgumentParser(
         description="Backtest fresh bullish signals with independent T1, T2, and T3 targets.")
@@ -679,7 +1037,9 @@ def main():
         cand = pd.read_parquet(CANDIDATES_FILE)
         print(f"Reusing {len(cand):,} candidates from {CANDIDATES_FILE}")
         required_cache_columns = {
-            "Direction", "T1_Outcome", "T2_Outcome", "T3_Outcome"
+            "Direction", "T1_Outcome", "T2_Outcome", "T3_Outcome",
+            "TechSymbol", "SignalRow", "BestHorizon", "CompositeScore",
+            "T1_TargetPct", "T2_TargetPct", "T3_TargetPct",
         }
         missing_cache_columns = required_cache_columns.difference(cand.columns)
         if missing_cache_columns:
@@ -746,7 +1106,12 @@ def main():
     if any(n < 1 for n in top_ns):
         sys.exit(f"[ERROR] --top-n values must be >= 1, got {top_ns}")
 
-    # One comparison table per dedicated target strategy.
+    os.makedirs("results", exist_ok=True)
+    # Only Date/Open/High/Close are cached for the dynamic position simulation.
+    # Shared across portfolio sizes and T1/T2/T3 so OHLC files are read once.
+    price_cache = {}
+
+    # Baseline and dynamic strategy are run together for each target and top-N.
     for target_num in (1, 2, 3):
         target_label = f"T{target_num}"
         rows = []
@@ -769,6 +1134,20 @@ def main():
 
             export_trader_log(sel, n, target_label=target_label)
             rows.append((n, headline_stats(sel)))
+
+            # Dynamic strategy: only new positions are restricted by top-N.
+            # Fresh signals for already-held stocks remain eligible for upgrades.
+            dynamic_trades, dynamic_transactions = simulate_dynamic_strategy(
+                cand, n, target_num, price_cache
+            )
+            dynamic_trades_path = f"results/backtest_dynamic_t{target_num}_trades_top{n}.csv"
+            dynamic_transactions_path = f"results/backtest_dynamic_t{target_num}_transactions_top{n}.csv"
+            dynamic_trades.to_csv(dynamic_trades_path, index=False)
+            dynamic_transactions.to_csv(dynamic_transactions_path, index=False)
+            print(f"  Dynamic {target_label} top {n:>3}: {len(dynamic_trades):>7,} positions "
+                  f"-> {dynamic_trades_path}")
+            print(f"    Buy/add/sell event log -> {dynamic_transactions_path}")
+            print_dynamic_summary(dynamic_trades, target_label, n)
 
         comparison_table(rows, target_label=target_label)
 
